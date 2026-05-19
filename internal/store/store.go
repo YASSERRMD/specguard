@@ -25,5 +25,6 @@ type Store interface {
 	SaveContractRun(run *ContractRun) error
 	GetContractRun(runID string) (*ContractRun, error)
 	ListContractRuns(specID string) ([]ContractRun, error)
+	ListSpecs() ([]string, error)
 	Close() error
 }
