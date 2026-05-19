@@ -310,6 +310,25 @@ func (s *SQLiteStore) ListContractRuns(specID string) ([]ContractRun, error) {
 	return runs, nil
 }
 
+// ListSpecs returns all spec IDs in the store.
+func (s *SQLiteStore) ListSpecs() ([]string, error) {
+	rows, err := s.db.Query("SELECT id FROM specs ORDER BY id ASC")
+	if err != nil {
+		return nil, fmt.Errorf("failed to query specs: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan spec id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // Close closes the underlying SQLite database.
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()

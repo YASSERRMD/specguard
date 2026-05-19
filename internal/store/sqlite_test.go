@@ -223,3 +223,34 @@ func TestSQLiteStore_ContractRuns(t *testing.T) {
 		t.Errorf("expected run-1 to be second, got %s", runs[1].ID)
 	}
 }
+
+func TestSQLiteStore_ListSpecs(t *testing.T) {
+	store, err := NewSQLiteStore(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create memory store: %v", err)
+	}
+	defer store.Close()
+
+	spec := &core.NormalizedSpec{Operations: map[string]core.Operation{}}
+
+	if err := store.SaveSpec("spec-b", spec); err != nil {
+		t.Fatalf("failed to save spec-b: %v", err)
+	}
+	if err := store.SaveSpec("spec-a", spec); err != nil {
+		t.Fatalf("failed to save spec-a: %v", err)
+	}
+
+	specs, err := store.ListSpecs()
+	if err != nil {
+		t.Fatalf("failed to list specs: %v", err)
+	}
+
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 specs, got %d", len(specs))
+	}
+
+	// Should be sorted alphabetically (spec-a, spec-b)
+	if specs[0] != "spec-a" || specs[1] != "spec-b" {
+		t.Errorf("unexpected list specs order: %v", specs)
+	}
+}
