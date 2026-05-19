@@ -56,10 +56,10 @@ func TestServer_Specs(t *testing.T) {
 	srv, dbStore := newTestServer(t)
 	defer dbStore.Close()
 
-	// 1. Upload spec
+	// 1. Upload pre-parsed spec
 	uploadReq := uploadSpecRequest{
 		ID: "petstore",
-		Spec: core.NormalizedSpec{
+		Spec: &core.NormalizedSpec{
 			Operations: map[string]core.Operation{
 				"GetPet": {ID: "GetPet"},
 			},
@@ -72,10 +72,39 @@ func TestServer_Specs(t *testing.T) {
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusCreated {
-		t.Errorf("expected 201 Created, got %d", resp.StatusCode)
+		t.Errorf("expected 201 Created for pre-parsed spec, got %d", resp.StatusCode)
 	}
 
-	// 2. List specs
+	// 2. Upload raw spec
+	rawOpenAPI := `
+openapi: 3.0.0
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: Get Pets
+      operationId: getPets
+      responses:
+        '200':
+          description: Success
+`
+	uploadRawReq := uploadSpecRequest{
+		ID:  "petstore-raw",
+		Raw: rawOpenAPI,
+	}
+	rawBodyBytes, _ := json.Marshal(uploadRawReq)
+	reqRaw := httptest.NewRequest("POST", "/api/specs", bytes.NewReader(rawBodyBytes))
+	wRaw := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wRaw, reqRaw)
+
+	respRaw := wRaw.Result()
+	if respRaw.StatusCode != http.StatusCreated {
+		t.Errorf("expected 201 Created for raw spec, got %d", respRaw.StatusCode)
+	}
+
+	// 3. List specs
 	reqList := httptest.NewRequest("GET", "/api/specs", nil)
 	wList := httptest.NewRecorder()
 	srv.server.Handler.ServeHTTP(wList, reqList)
@@ -87,8 +116,8 @@ func TestServer_Specs(t *testing.T) {
 
 	var specs []string
 	_ = json.NewDecoder(respList.Body).Decode(&specs)
-	if len(specs) != 1 || specs[0] != "petstore" {
-		t.Errorf("unexpected spec list: %v", specs)
+	if len(specs) != 2 {
+		t.Errorf("expected 2 specs in list, got: %v", specs)
 	}
 }
 

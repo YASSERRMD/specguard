@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/YASSERRMD/specguard/internal/server"
 	"github.com/YASSERRMD/specguard/internal/store"
 )
@@ -191,20 +192,18 @@ func handleSpecCmd() {
 			os.Exit(1)
 		}
 
-		// Prepare spec upload structure. If it is JSON mapping to NormalizedSpec, use it.
-		// Otherwise, send a dummy NormalizedSpec with raw contents.
 		var payload map[string]interface{}
-		if err := json.Unmarshal(content, &payload); err != nil {
-			// If not valid NormalizedSpec JSON, create placeholder
+		var spec core.NormalizedSpec
+		if err := json.Unmarshal(content, &spec); err == nil && len(spec.Operations) > 0 {
 			payload = map[string]interface{}{
-				"id": id,
-				"spec": map[string]interface{}{
-					"operations": map[string]interface{}{},
-				},
+				"id":   id,
+				"spec": spec,
 			}
 		} else {
-			// Ensure ID is set
-			payload["id"] = id
+			payload = map[string]interface{}{
+				"id":  id,
+				"raw": string(content),
+			}
 		}
 
 		resp, status, err := makeRequest("POST", "/api/specs", payload)
