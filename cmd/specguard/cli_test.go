@@ -1,12 +1,17 @@
 package main
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/YASSERRMD/specguard/internal/server"
+	"github.com/YASSERRMD/specguard/internal/store"
 )
 
 // TestCLIHelperProcess is the helper process called by execCLI to run main() in tests.
@@ -154,5 +159,71 @@ func TestCLI_UnknownCommands(t *testing.T) {
 	}
 	if !strings.Contains(out, "Usage: specguard") {
 		t.Errorf("expected usage output, got: %s", out)
+	}
+}
+
+const testOpenAPISpec = `
+openapi: 3.0.0
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /users/{id}:
+    get:
+      summary: Get User
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Success
+`
+
+func TestCLI_IntegrationWithRealServer(t *testing.T) {
+	cfg := &server.Config{
+		Port:     "0",
+		DBDSN:    ":memory:",
+		LogLevel: "info",
+	}
+	dbStore, err := store.NewSQLiteStore(cfg.DBDSN)
+	if err != nil {
+		t.Fatalf("failed to initialize store: %v", err)
+	}
+	defer dbStore.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := server.NewServer(cfg, dbStore, logger)
+
+	testSrv := httptest.NewServer(srv.Handler())
+	defer testSrv.Close()
+
+	tmpFile, err := os.CreateTemp("", "openapi-*.yaml")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	_, _ = tmpFile.Write([]byte(testOpenAPISpec))
+	tmpFile.Close()
+
+	out, err := execCLI(t, testSrv.URL, "spec", "add", "my-openapi-spec", tmpFile.Name())
+	if err != nil {
+		t.Errorf("real spec add failed: %v, output: %s", err, out)
+	}
+	if !strings.Contains(out, "added successfully") {
+		t.Errorf("expected success message, got: %s", out)
+	}
+
+	outList, err := execCLI(t, testSrv.URL, "spec", "list")
+	if err != nil {
+		t.Errorf("real spec list failed: %v, output: %s", err, outList)
+	}
+	if !strings.Contains(outList, "- my-openapi-spec") {
+		t.Errorf("expected my-openapi-spec in list, got: %s", outList)
 	}
 }

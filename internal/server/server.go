@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YASSERRMD/specguard/internal/adapters/rest"
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/YASSERRMD/specguard/internal/store"
 )
@@ -65,6 +66,11 @@ func (s *Server) GetAddress() string {
 	return s.server.Addr
 }
 
+// Handler returns the HTTP handler of the server.
+func (s *Server) Handler() http.Handler {
+	return s.server.Handler
+}
+
 // Stop gracefully shuts down the server.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down server")
@@ -102,8 +108,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 type uploadSpecRequest struct {
-	ID   string              `json:"id"`
-	Spec core.NormalizedSpec `json:"spec"`
+	ID   string               `json:"id"`
+	Spec *core.NormalizedSpec `json:"spec,omitempty"`
+	Raw  string               `json:"raw,omitempty"`
 }
 
 func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +127,24 @@ func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := s.store.SaveSpec(req.ID, &req.Spec); err != nil {
+		var spec *core.NormalizedSpec
+		if req.Raw != "" {
+			adapter := rest.NewAdapter()
+			var err error
+			spec, err = adapter.LoadSpec([]byte(req.Raw))
+			if err != nil {
+				s.logger.Error("failed to parse spec", "id", req.ID, "error", err)
+				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse spec: %v", err))
+				return
+			}
+		} else if req.Spec != nil {
+			spec = req.Spec
+		} else {
+			s.writeError(w, http.StatusBadRequest, "Missing spec or raw content")
+			return
+		}
+
+		if err := s.store.SaveSpec(req.ID, spec); err != nil {
 			s.logger.Error("failed to save spec", "id", req.ID, "error", err)
 			s.writeError(w, http.StatusInternalServerError, "Failed to save spec")
 			return
