@@ -1,0 +1,24 @@
+CREATE TABLE IF NOT EXISTS specs (
+    id TEXT PRIMARY KEY,
+    spec_data TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mock_configs (
+    id TEXT PRIMARY KEY,
+    config_data TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS contract_runs (
+    id TEXT PRIMARY KEY,
+    spec_id TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    passed BOOLEAN NOT NULL,
+    report_data TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY
+);
