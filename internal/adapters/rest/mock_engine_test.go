@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YASSERRMD/specguard/internal/core"
 )
@@ -940,5 +941,184 @@ paths:
 	}
 	if resp.Header.Get("X-Metadata-Tea") != "yes" {
 		t.Errorf("expected X-Metadata-Tea header to be yes, got %v", resp.Header.Get("X-Metadata-Tea"))
+	}
+}
+
+func TestMockServerChaos(t *testing.T) {
+	rawOpenAPI := `
+openapi: 3.0.3
+info:
+  title: Chaos Pets API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: List all pets
+      operationId: listPets
+      responses:
+        '200':
+          description: A list of pets
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - total
+                properties:
+                  total:
+                    type: integer
+`
+
+	adapter := NewAdapter()
+	spec, err := adapter.LoadSpec([]byte(rawOpenAPI))
+	if err != nil {
+		t.Fatalf("failed to load specification: %v", err)
+	}
+
+	// 1. Test Latency Injection (via configuration)
+	configLatency := core.MockConfig{
+		Host: "127.0.0.1",
+		Port: 0,
+		Chaos: &core.ChaosConfig{
+			LatencyMs:       100,
+			LatencyJitterMs: 10,
+		},
+	}
+	serverLatency, err := adapter.GenerateMock(spec, configLatency)
+	if err != nil {
+		t.Fatalf("failed to generate mock: %v", err)
+	}
+	if err = serverLatency.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer serverLatency.Stop()
+
+	client := &http.Client{}
+	addrLatency := serverLatency.GetAddress()
+
+	startTime := time.Now()
+	resp, err := client.Get(addrLatency + "/pets")
+	if err != nil {
+		t.Fatalf("failed request: %v", err)
+	}
+	resp.Body.Close()
+	elapsed := time.Since(startTime)
+
+	if elapsed < 85*time.Millisecond {
+		t.Errorf("expected latency delay, but request completed in %v", elapsed)
+	}
+
+	// 2. Test Error Rate Injection (via configuration)
+	configError := core.MockConfig{
+		Host: "127.0.0.1",
+		Port: 0,
+		Chaos: &core.ChaosConfig{
+			ErrorRate:   1.0,
+			ErrorStatus: 503,
+		},
+	}
+	serverError, err := adapter.GenerateMock(spec, configError)
+	if err != nil {
+		t.Fatalf("failed to generate mock: %v", err)
+	}
+	if err = serverError.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer serverError.Stop()
+
+	addrError := serverError.GetAddress()
+	resp, err = client.Get(addrError + "/pets")
+	if err != nil {
+		t.Fatalf("failed request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 503 {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	}
+
+	// 3. Test Connection Dropping (via configuration)
+	configDrop := core.MockConfig{
+		Host: "127.0.0.1",
+		Port: 0,
+		Chaos: &core.ChaosConfig{
+			DropConnectionRate: 1.0,
+		},
+	}
+	serverDrop, err := adapter.GenerateMock(spec, configDrop)
+	if err != nil {
+		t.Fatalf("failed to generate mock: %v", err)
+	}
+	if err = serverDrop.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer serverDrop.Stop()
+
+	addrDrop := serverDrop.GetAddress()
+	// Disable keep alives to ensure connection drops are noticed immediately
+	tr := &http.Transport{DisableKeepAlives: true}
+	dropClient := &http.Client{Transport: tr}
+	_, err = dropClient.Get(addrDrop + "/pets")
+	if err == nil {
+		t.Errorf("expected request to fail due to dropped/closed connection, but succeeded")
+	}
+
+	// 4. Test Header-based Overrides
+	configNoChaos := core.MockConfig{
+		Host: "127.0.0.1",
+		Port: 0,
+	}
+	serverNoChaos, err := adapter.GenerateMock(spec, configNoChaos)
+	if err != nil {
+		t.Fatalf("failed to generate mock: %v", err)
+	}
+	if err = serverNoChaos.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+	defer serverNoChaos.Stop()
+
+	addrNoChaos := serverNoChaos.GetAddress()
+
+	// 4a. Header Latency Override
+	req, err := http.NewRequest("GET", addrNoChaos+"/pets", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Chaos-Latency", "100ms")
+	startTime = time.Now()
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	elapsed = time.Since(startTime)
+	if elapsed < 85*time.Millisecond {
+		t.Errorf("expected header delay override, request finished in %v", elapsed)
+	}
+
+	// 4b. Header Error Override
+	req, err = http.NewRequest("GET", addrNoChaos+"/pets", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Chaos-Error-Rate", "1.0")
+	req.Header.Set("X-Chaos-Error-Status", "418")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 418 {
+		t.Errorf("expected status 418 override, got %d", resp.StatusCode)
+	}
+
+	// 4c. Header Drop Connection Override
+	req, err = http.NewRequest("GET", addrNoChaos+"/pets", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-Chaos-Drop-Rate", "1.0")
+	_, err = dropClient.Do(req)
+	if err == nil {
+		t.Errorf("expected header drop connection override to fail request, but succeeded")
 	}
 }
