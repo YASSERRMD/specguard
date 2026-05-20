@@ -20,6 +20,16 @@ type MockConfig struct {
 	Port           int                    `json:"port"`
 	Host           string                 `json:"host"`
 	ProtocolConfig map[string]interface{} `json:"protocol_config,omitempty"`
+	Chaos          *ChaosConfig           `json:"chaos,omitempty"`
+}
+
+// ChaosConfig defines parameters for fault and chaos injection.
+type ChaosConfig struct {
+	LatencyMs          int     `json:"latency_ms,omitempty"`
+	LatencyJitterMs    int     `json:"latency_jitter_ms,omitempty"`
+	ErrorRate          float64 `json:"error_rate,omitempty"`
+	ErrorStatus        int     `json:"error_status,omitempty"`
+	DropConnectionRate float64 `json:"drop_connection_rate,omitempty"`
 }
 
 // RunnableMock represents a running mock server instance.
