@@ -24,14 +24,161 @@ type MockServer struct {
 	address  string
 	mu       sync.Mutex
 	running  bool
+
+	stateMu     sync.RWMutex
+	state       map[string][]map[string]interface{}
+	counters    map[string]int64
+	initialized map[string]bool
 }
 
 // NewMockServer creates a new instance of MockServer.
 func NewMockServer(spec *core.NormalizedSpec, config core.MockConfig) *MockServer {
-	return &MockServer{
-		spec:   spec,
-		config: config,
+	ms := &MockServer{
+		spec:        spec,
+		config:      config,
+		state:       make(map[string][]map[string]interface{}),
+		counters:    make(map[string]int64),
+		initialized: make(map[string]bool),
 	}
+	ms.seedState()
+	return ms
+}
+
+func (m *MockServer) seedState() {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	if m.config.ProtocolConfig == nil {
+		return
+	}
+	rawState, ok := m.config.ProtocolConfig["initial_state"]
+	if !ok {
+		return
+	}
+	stateMap, ok := rawState.(map[string]interface{})
+	if !ok {
+		return
+	}
+	for path, itemsVal := range stateMap {
+		itemsSlice, ok := itemsVal.([]interface{})
+		if !ok {
+			continue
+		}
+		var records []map[string]interface{}
+		for _, itemVal := range itemsSlice {
+			if itemMap, ok := itemVal.(map[string]interface{}); ok {
+				records = append(records, itemMap)
+			}
+		}
+		m.state[path] = records
+		m.initialized[path] = true
+	}
+}
+
+func (m *MockServer) ResetState() {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	m.state = make(map[string][]map[string]interface{})
+	m.counters = make(map[string]int64)
+	m.initialized = make(map[string]bool)
+}
+
+func parseResourcePath(pattern string, pathParams map[string]string) (string, string, bool) {
+	pattern = "/" + strings.Trim(pattern, "/")
+	if pattern == "/" {
+		return "/", "", false
+	}
+	segs := strings.Split(pattern, "/")
+	lastSeg := segs[len(segs)-1]
+
+	isMember := false
+	var itemId string
+	var collectionPattern string
+
+	if strings.HasPrefix(lastSeg, "{") && strings.HasSuffix(lastSeg, "}") {
+		isMember = true
+		paramName := lastSeg[1 : len(lastSeg)-1]
+		itemId = pathParams[paramName]
+		collectionPattern = strings.Join(segs[:len(segs)-1], "/")
+	} else {
+		collectionPattern = pattern
+	}
+
+	collectionKey := collectionPattern
+	for name, val := range pathParams {
+		placeholder := "{" + name + "}"
+		collectionKey = strings.ReplaceAll(collectionKey, placeholder, val)
+	}
+
+	return collectionKey, itemId, isMember
+}
+
+func mergeValues(dest, src interface{}) interface{} {
+	if src == nil {
+		return dest
+	}
+	if dest == nil {
+		return src
+	}
+
+	destMap, destOk := dest.(map[string]interface{})
+	srcMap, srcOk := src.(map[string]interface{})
+
+	if destOk && srcOk {
+		merged := make(map[string]interface{})
+		for k, v := range destMap {
+			merged[k] = v
+		}
+		for k, v := range srcMap {
+			if existing, exists := merged[k]; exists {
+				merged[k] = mergeValues(existing, v)
+			} else {
+				merged[k] = v
+			}
+		}
+		return merged
+	}
+
+	return src
+}
+
+func (m *MockServer) generateIdForCollection(collectionKey string, schema *core.Schema) interface{} {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	var idSchema *core.Schema
+	if schema != nil && schema.Type == core.TypeObject {
+		if idProp, ok := schema.Properties["id"]; ok {
+			idSchema = &idProp
+		}
+	}
+
+	isInteger := false
+	isUUID := false
+	if idSchema != nil && idSchema.Type == core.TypeScalar {
+		if idSchema.ScalarType == core.ScalarInteger || idSchema.ScalarType == core.ScalarNumber {
+			isInteger = true
+		} else if idSchema.ScalarType == core.ScalarString {
+			for _, c := range idSchema.Constraints {
+				if c.Kind == "format" && c.Value == "uuid" {
+					isUUID = true
+					break
+				}
+			}
+		}
+	}
+
+	if isInteger {
+		m.counters[collectionKey]++
+		return float64(m.counters[collectionKey])
+	}
+
+	if isUUID {
+		m.counters[collectionKey]++
+		return fmt.Sprintf("123e4567-e89b-12d3-a456-%012d", m.counters[collectionKey])
+	}
+
+	m.counters[collectionKey]++
+	return fmt.Sprintf("id-%d", m.counters[collectionKey])
 }
 
 // Start starts the mock HTTP server in the background.
@@ -95,6 +242,12 @@ func (m *MockServer) GetAddress() string {
 }
 
 func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/__reset" && r.Method == http.MethodPost {
+		m.ResetState()
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	var matchedOp *core.Operation
 	var pathParams map[string]string
 
@@ -213,6 +366,30 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Scenario selection
+	scenarioName := r.URL.Query().Get("_scenario")
+	if scenarioName == "" {
+		scenarioName = r.URL.Query().Get("scenario")
+	}
+	if scenarioName == "" {
+		scenarioName = r.Header.Get("X-Mock-Scenario")
+	}
+	if scenarioName == "" {
+		scenarioName = r.Header.Get("X-Scenario")
+	}
+	scenarioName = strings.TrimSpace(scenarioName)
+
+	if scenarioName != "" && scenarioName != "success" {
+		if m.handleScenario(w, r, matchedOp, scenarioName) {
+			return
+		}
+	}
+
+	// Try stateful CRUD
+	if m.handleStatefulCRUD(w, r, matchedOp, pathParams, reqVal) {
+		return
+	}
+
 	// Select low 2xx response status
 	selectedStatus := 200
 	var responseSchema *core.Schema
@@ -240,6 +417,520 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	mockResp := generateMockValue(*responseSchema)
 	m.writeJSON(w, selectedStatus, mockResp)
+}
+
+func (m *MockServer) handleScenario(w http.ResponseWriter, r *http.Request, matchedOp *core.Operation, scenarioName string) bool {
+	var status int
+	var body interface{}
+	var headers map[string]interface{}
+	found := false
+
+	parseScenarioDef := func(def interface{}) bool {
+		mDef, ok := def.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if sVal, ok := mDef["status"]; ok {
+			switch v := sVal.(type) {
+			case float64:
+				status = int(v)
+			case int:
+				status = v
+			case int64:
+				status = int(v)
+			case string:
+				if st, err := strconv.Atoi(v); err == nil {
+					status = st
+				}
+			}
+		}
+		if bVal, ok := mDef["body"]; ok {
+			body = bVal
+		}
+		if hVal, ok := mDef["headers"]; ok {
+			if hm, ok := hVal.(map[string]interface{}); ok {
+				headers = hm
+			}
+		}
+		return true
+	}
+
+	if m.config.ProtocolConfig != nil {
+		if ops, ok := m.config.ProtocolConfig["operations"].(map[string]interface{}); ok {
+			if opDef, ok := ops[matchedOp.ID].(map[string]interface{}); ok {
+				if scs, ok := opDef["scenarios"].(map[string]interface{}); ok {
+					if scDef, ok := scs[scenarioName]; ok {
+						if parseScenarioDef(scDef) {
+							found = true
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			if scs, ok := m.config.ProtocolConfig["scenarios"].(map[string]interface{}); ok {
+				if scDef, ok := scs[scenarioName]; ok {
+					if parseScenarioDef(scDef) {
+						found = true
+					}
+				}
+			}
+		}
+	}
+
+	if !found && matchedOp.Metadata != nil {
+		statusKey := fmt.Sprintf("scenario:%s:status", scenarioName)
+		bodyKey := fmt.Sprintf("scenario:%s:body", scenarioName)
+		headersKey := fmt.Sprintf("scenario:%s:headers", scenarioName)
+
+		if stStr, ok := matchedOp.Metadata[statusKey]; ok {
+			if st, err := strconv.Atoi(stStr); err == nil {
+				status = st
+				found = true
+			}
+		}
+		if bodyStr, ok := matchedOp.Metadata[bodyKey]; ok {
+			var jsonVal interface{}
+			if err := json.Unmarshal([]byte(bodyStr), &jsonVal); err == nil {
+				body = jsonVal
+			} else {
+				body = bodyStr
+			}
+			found = true
+		}
+		if hStr, ok := matchedOp.Metadata[headersKey]; ok {
+			var hMap map[string]interface{}
+			if err := json.Unmarshal([]byte(hStr), &hMap); err == nil {
+				headers = hMap
+			}
+		}
+	}
+
+	if !found {
+		switch scenarioName {
+		case "not-found":
+			status = http.StatusNotFound
+			if shape, exists := matchedOp.ErrorShapes["404"]; exists {
+				body = generateMockValue(shape)
+			} else {
+				body = map[string]string{"error": "Not Found"}
+			}
+			found = true
+
+		case "server-error":
+			status = http.StatusInternalServerError
+			if shape, exists := matchedOp.ErrorShapes["500"]; exists {
+				body = generateMockValue(shape)
+			} else {
+				body = map[string]string{"error": "Internal Server Error"}
+			}
+			found = true
+
+		case "empty-result":
+			successStatus := 200
+			var successSchema *core.Schema
+			lowestSuccess := 999
+			for statusStr, schema := range matchedOp.Output.Properties {
+				st, err := strconv.Atoi(statusStr)
+				if err == nil && st >= 200 && st < 300 {
+					if st < lowestSuccess {
+						lowestSuccess = st
+						s := schema
+						successSchema = &s
+					}
+				}
+			}
+			if lowestSuccess != 999 {
+				successStatus = lowestSuccess
+			}
+
+			status = successStatus
+			if successSchema != nil {
+				body = m.formatListResponse(*successSchema, nil, 10, 0)
+			} else {
+				body = nil
+			}
+			found = true
+		}
+	}
+
+	if found {
+		for k, v := range headers {
+			w.Header().Set(k, fmt.Sprintf("%v", v))
+		}
+		if status == 0 {
+			status = 200
+		}
+		if body == nil {
+			w.WriteHeader(status)
+		} else {
+			m.writeJSON(w, status, body)
+		}
+		return true
+	}
+
+	m.writeError(w, http.StatusBadRequest, fmt.Sprintf("scenario %q is not defined", scenarioName))
+	return true
+}
+
+func (m *MockServer) handleStatefulCRUD(w http.ResponseWriter, r *http.Request, matchedOp *core.Operation, pathParams map[string]string, reqVal map[string]interface{}) bool {
+	opPath := matchedOp.Metadata["path"]
+	collectionKey, itemId, isMember := parseResourcePath(opPath, pathParams)
+
+	successStatus := 200
+	var successSchema *core.Schema
+	lowestSuccess := 999
+	for statusStr, schema := range matchedOp.Output.Properties {
+		status, err := strconv.Atoi(statusStr)
+		if err == nil && status >= 200 && status < 300 {
+			if status < lowestSuccess {
+				lowestSuccess = status
+				s := schema
+				successSchema = &s
+			}
+		}
+	}
+	if lowestSuccess != 999 {
+		successStatus = lowestSuccess
+	}
+
+	switch r.Method {
+	case http.MethodPost:
+		if isMember {
+			return false
+		}
+		bodyVal, exists := reqVal["body"]
+		if !exists {
+			bodyVal = make(map[string]interface{})
+		}
+		bodyMap, ok := bodyVal.(map[string]interface{})
+		if !ok {
+			return false
+		}
+
+		idKey := ""
+		var currentId interface{}
+		for k, v := range bodyMap {
+			if strings.ToLower(k) == "id" {
+				idKey = k
+				currentId = v
+				break
+			}
+		}
+
+		if currentId == nil || fmt.Sprintf("%v", currentId) == "" {
+			var respSchema *core.Schema
+			if successSchema != nil {
+				respSchema = successSchema
+			}
+			currentId = m.generateIdForCollection(collectionKey, respSchema)
+			if idKey == "" {
+				idKey = "id"
+			}
+			bodyMap[idKey] = currentId
+		}
+
+		m.stateMu.Lock()
+		m.state[collectionKey] = append(m.state[collectionKey], bodyMap)
+		m.initialized[collectionKey] = true
+		m.stateMu.Unlock()
+
+		var respVal interface{} = bodyMap
+		if successSchema != nil {
+			baseline := generateMockValue(*successSchema)
+			respVal = mergeValues(baseline, bodyMap)
+		}
+		m.writeJSON(w, successStatus, respVal)
+		return true
+
+	case http.MethodGet:
+		m.stateMu.RLock()
+		isInit := m.initialized[collectionKey]
+		m.stateMu.RUnlock()
+		if !isInit {
+			return false
+		}
+
+		if isMember {
+			m.stateMu.RLock()
+			records := m.state[collectionKey]
+			var foundRecord map[string]interface{}
+			for _, rec := range records {
+				for k, v := range rec {
+					if strings.ToLower(k) == "id" && fmt.Sprintf("%v", v) == itemId {
+						foundRecord = rec
+						break
+					}
+				}
+				if foundRecord != nil {
+					break
+				}
+			}
+			m.stateMu.RUnlock()
+
+			if foundRecord != nil {
+				var respVal interface{} = foundRecord
+				if successSchema != nil {
+					baseline := generateMockValue(*successSchema)
+					respVal = mergeValues(baseline, foundRecord)
+				}
+				m.writeJSON(w, successStatus, respVal)
+				return true
+			}
+
+			m.writeResourceNotFound(w, matchedOp)
+			return true
+		} else {
+			m.stateMu.RLock()
+			records := make([]interface{}, len(m.state[collectionKey]))
+			for i, rec := range m.state[collectionKey] {
+				records[i] = rec
+			}
+			m.stateMu.RUnlock()
+
+			limit := 10
+			offset := 0
+
+			queryMap, _ := reqVal["query"].(map[string]interface{})
+			if queryMap != nil {
+				for _, k := range []string{"limit", "per_page", "size", "pageSize"} {
+					if val, ok := queryMap[k]; ok {
+						if num, err := toFloat64(val); err == nil && num > 0 {
+							limit = int(num)
+						}
+					}
+				}
+				offsetFound := false
+				for _, k := range []string{"offset", "skip"} {
+					if val, ok := queryMap[k]; ok {
+						if num, err := toFloat64(val); err == nil && num >= 0 {
+							offset = int(num)
+							offsetFound = true
+						}
+					}
+				}
+				if !offsetFound {
+					for _, k := range []string{"page", "pageNum"} {
+						if val, ok := queryMap[k]; ok {
+							if num, err := toFloat64(val); err == nil && num >= 1 {
+								page := int(num)
+								offset = (page - 1) * limit
+							}
+						}
+					}
+				}
+			}
+
+			var respVal interface{}
+			if successSchema != nil {
+				respVal = m.formatListResponse(*successSchema, records, limit, offset)
+			} else {
+				respVal = records
+			}
+			m.writeJSON(w, successStatus, respVal)
+			return true
+		}
+
+	case http.MethodPut:
+		if !isMember {
+			return false
+		}
+		m.stateMu.RLock()
+		isInit := m.initialized[collectionKey]
+		m.stateMu.RUnlock()
+		if !isInit {
+			return false
+		}
+
+		bodyVal, exists := reqVal["body"]
+		if !exists {
+			bodyVal = make(map[string]interface{})
+		}
+		bodyMap, ok := bodyVal.(map[string]interface{})
+		if !ok {
+			return false
+		}
+
+		m.stateMu.Lock()
+		records := m.state[collectionKey]
+		foundIdx := -1
+		var existingRecord map[string]interface{}
+		for i, rec := range records {
+			for k, v := range rec {
+				if strings.ToLower(k) == "id" && fmt.Sprintf("%v", v) == itemId {
+					foundIdx = i
+					existingRecord = rec
+					break
+				}
+			}
+			if foundIdx != -1 {
+				break
+			}
+		}
+
+		if foundIdx != -1 {
+			updatedRecord := make(map[string]interface{})
+			for k, v := range existingRecord {
+				updatedRecord[k] = v
+			}
+			for k, v := range bodyMap {
+				if strings.ToLower(k) == "id" {
+					continue
+				}
+				updatedRecord[k] = v
+			}
+			m.state[collectionKey][foundIdx] = updatedRecord
+			m.stateMu.Unlock()
+
+			var respVal interface{} = updatedRecord
+			if successSchema != nil {
+				baseline := generateMockValue(*successSchema)
+				respVal = mergeValues(baseline, updatedRecord)
+			}
+			m.writeJSON(w, successStatus, respVal)
+			return true
+		}
+		m.stateMu.Unlock()
+
+		m.writeResourceNotFound(w, matchedOp)
+		return true
+
+	case http.MethodDelete:
+		if !isMember {
+			return false
+		}
+		m.stateMu.RLock()
+		isInit := m.initialized[collectionKey]
+		m.stateMu.RUnlock()
+		if !isInit {
+			return false
+		}
+
+		m.stateMu.Lock()
+		records := m.state[collectionKey]
+		foundIdx := -1
+		for i, rec := range records {
+			for k, v := range rec {
+				if strings.ToLower(k) == "id" && fmt.Sprintf("%v", v) == itemId {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx != -1 {
+				break
+			}
+		}
+
+		if foundIdx != -1 {
+			m.state[collectionKey] = append(records[:foundIdx], records[foundIdx+1:]...)
+			m.stateMu.Unlock()
+
+			if successStatus == http.StatusNoContent {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				if successSchema != nil {
+					m.writeJSON(w, successStatus, generateMockValue(*successSchema))
+				} else {
+					w.WriteHeader(successStatus)
+				}
+			}
+			return true
+		}
+		m.stateMu.Unlock()
+
+		m.writeResourceNotFound(w, matchedOp)
+		return true
+	}
+
+	return false
+}
+
+func (m *MockServer) writeResourceNotFound(w http.ResponseWriter, matchedOp *core.Operation) {
+	if shape, exists := matchedOp.ErrorShapes["404"]; exists {
+		m.writeJSON(w, http.StatusNotFound, generateMockValue(shape))
+	} else {
+		m.writeError(w, http.StatusNotFound, "resource not found")
+	}
+}
+
+func (m *MockServer) formatListResponse(schema core.Schema, records []interface{}, limit, offset int) interface{} {
+	total := len(records)
+	start := offset
+	if start < 0 {
+		start = 0
+	}
+	if start > total {
+		start = total
+	}
+	end := start + limit
+	if end > total {
+		end = total
+	}
+	var sliced []interface{}
+	if start < end {
+		sliced = records[start:end]
+	} else {
+		sliced = []interface{}{}
+	}
+
+	if schema.Type == core.TypeArray {
+		items := []interface{}{}
+		for _, rec := range sliced {
+			if schema.Item != nil {
+				baseline := generateMockValue(*schema.Item)
+				items = append(items, mergeValues(baseline, rec))
+			} else {
+				items = append(items, rec)
+			}
+		}
+		return items
+	}
+
+	if schema.Type == core.TypeObject {
+		obj := generateMockValue(schema).(map[string]interface{})
+		arrayKey := ""
+		var arrayItemSchema *core.Schema
+		for k, prop := range schema.Properties {
+			if prop.Type == core.TypeArray {
+				arrayKey = k
+				arrayItemSchema = prop.Item
+				break
+			}
+		}
+
+		if arrayKey != "" {
+			items := []interface{}{}
+			for _, rec := range sliced {
+				if arrayItemSchema != nil {
+					baseline := generateMockValue(*arrayItemSchema)
+					items = append(items, mergeValues(baseline, rec))
+				} else {
+					items = append(items, rec)
+				}
+			}
+			obj[arrayKey] = items
+		}
+
+		for k := range schema.Properties {
+			kl := strings.ToLower(k)
+			if kl == "total" || kl == "count" || kl == "total_results" || kl == "total_elements" {
+				obj[k] = float64(total)
+			} else if kl == "limit" || kl == "size" || kl == "per_page" {
+				obj[k] = float64(limit)
+			} else if kl == "offset" {
+				obj[k] = float64(offset)
+			} else if kl == "page" {
+				pageVal := 1
+				if limit > 0 {
+					pageVal = (offset / limit) + 1
+				}
+				obj[k] = float64(pageVal)
+			}
+		}
+		return obj
+	}
+
+	return generateMockValue(schema)
 }
 
 func (m *MockServer) writeJSON(w http.ResponseWriter, status int, val interface{}) {
@@ -376,4 +1067,35 @@ func generateMockValue(s core.Schema) interface{} {
 	}
 
 	return nil
+}
+
+func toFloat64(val interface{}) (float64, error) {
+	switch v := val.(type) {
+	case float64:
+		return v, nil
+	case float32:
+		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case int32:
+		return float64(v), nil
+	case int16:
+		return float64(v), nil
+	case int8:
+		return float64(v), nil
+	case uint:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
+	case uint32:
+		return float64(v), nil
+	case uint16:
+		return float64(v), nil
+	case uint8:
+		return float64(v), nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", val)
+	}
 }
