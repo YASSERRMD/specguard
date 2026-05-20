@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strconv"
@@ -245,6 +246,10 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/__reset" && r.Method == http.MethodPost {
 		m.ResetState()
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if m.evaluateChaos(w, r) {
 		return
 	}
 
@@ -1098,4 +1103,112 @@ func toFloat64(val interface{}) (float64, error) {
 	default:
 		return 0, fmt.Errorf("cannot convert %T to float64", val)
 	}
+}
+
+func (m *MockServer) evaluateChaos(w http.ResponseWriter, r *http.Request) bool {
+	latencyMs := 0
+	latencyJitterMs := 0
+	errorRate := 0.0
+	errorStatus := 500
+	dropConnectionRate := 0.0
+
+	if m.config.Chaos != nil {
+		latencyMs = m.config.Chaos.LatencyMs
+		latencyJitterMs = m.config.Chaos.LatencyJitterMs
+		errorRate = m.config.Chaos.ErrorRate
+		errorStatus = m.config.Chaos.ErrorStatus
+		dropConnectionRate = m.config.Chaos.DropConnectionRate
+	}
+
+	if hDelay := r.Header.Get("X-Chaos-Delay"); hDelay != "" {
+		if val, err := strconv.Atoi(hDelay); err == nil {
+			latencyMs = val
+		} else if dur, err := time.ParseDuration(hDelay); err == nil {
+			latencyMs = int(dur.Milliseconds())
+		}
+	} else if hLatency := r.Header.Get("X-Chaos-Latency"); hLatency != "" {
+		if val, err := strconv.Atoi(hLatency); err == nil {
+			latencyMs = val
+		} else if dur, err := time.ParseDuration(hLatency); err == nil {
+			latencyMs = int(dur.Milliseconds())
+		}
+	}
+
+	if hJitter := r.Header.Get("X-Chaos-Delay-Jitter"); hJitter != "" {
+		if val, err := strconv.Atoi(hJitter); err == nil {
+			latencyJitterMs = val
+		} else if dur, err := time.ParseDuration(hJitter); err == nil {
+			latencyJitterMs = int(dur.Milliseconds())
+		}
+	} else if hLatencyJitter := r.Header.Get("X-Chaos-Latency-Jitter"); hLatencyJitter != "" {
+		if val, err := strconv.Atoi(hLatencyJitter); err == nil {
+			latencyJitterMs = val
+		} else if dur, err := time.ParseDuration(hLatencyJitter); err == nil {
+			latencyJitterMs = int(dur.Milliseconds())
+		}
+	}
+
+	if hErrRate := r.Header.Get("X-Chaos-Error-Rate"); hErrRate != "" {
+		if val, err := strconv.ParseFloat(hErrRate, 64); err == nil {
+			errorRate = val
+		}
+	}
+
+	if hErrStatus := r.Header.Get("X-Chaos-Error-Status"); hErrStatus != "" {
+		if val, err := strconv.Atoi(hErrStatus); err == nil {
+			errorStatus = val
+		}
+	}
+
+	if hDropRate := r.Header.Get("X-Chaos-Drop-Rate"); hDropRate != "" {
+		if val, err := strconv.ParseFloat(hDropRate, 64); err == nil {
+			dropConnectionRate = val
+		}
+	} else if hDropConnRate := r.Header.Get("X-Chaos-Drop-Connection-Rate"); hDropConnRate != "" {
+		if val, err := strconv.ParseFloat(hDropConnRate, 64); err == nil {
+			dropConnectionRate = val
+		}
+	}
+
+	if errorStatus <= 0 {
+		errorStatus = 500
+	}
+
+	if dropConnectionRate > 0 {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		if rng.Float64() < dropConnectionRate {
+			if hijacker, ok := w.(http.Hijacker); ok {
+				conn, _, err := hijacker.Hijack()
+				if err == nil && conn != nil {
+					conn.Close()
+					return true
+				}
+			}
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+	}
+
+	if latencyMs > 0 {
+		delay := time.Duration(latencyMs) * time.Millisecond
+		if latencyJitterMs > 0 {
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			jitter := rng.Intn(latencyJitterMs*2) - latencyJitterMs
+			delay += time.Duration(jitter) * time.Millisecond
+		}
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+
+	if errorRate > 0 {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		if rng.Float64() < errorRate {
+			m.writeError(w, errorStatus, fmt.Sprintf("Chaos injection triggered: simulated error with status code %d", errorStatus))
+			return true
+		}
+	}
+
+	return false
 }
