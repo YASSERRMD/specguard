@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -225,5 +226,50 @@ func TestCLI_IntegrationWithRealServer(t *testing.T) {
 	}
 	if !strings.Contains(outList, "- my-openapi-spec") {
 		t.Errorf("expected my-openapi-spec in list, got: %s", outList)
+	}
+
+	// 3. Test mock start command on real server
+	outMockStart, err := execCLI(t, testSrv.URL, "mock", "start", "my-openapi-spec")
+	if err != nil {
+		t.Errorf("real mock start failed: %v, output: %s", err, outMockStart)
+	}
+	if !strings.Contains(outMockStart, "Status: 200") || !strings.Contains(outMockStart, `"status":"started"`) {
+		t.Errorf("expected success start response, got: %s", outMockStart)
+	}
+
+	// Extract the address from response to do a quick sanity check
+	var startResult struct {
+		Address string `json:"address"`
+	}
+	parts := strings.Split(outMockStart, "Response: ")
+	if len(parts) >= 2 {
+		jsonStr := parts[1]
+		if idx := strings.LastIndex(jsonStr, "}"); idx != -1 {
+			jsonStr = jsonStr[:idx+1]
+		}
+		_ = json.Unmarshal([]byte(jsonStr), &startResult)
+	}
+	if startResult.Address == "" {
+		t.Errorf("mock address not found in output: %s", outMockStart)
+	} else {
+		// Verify mock server responds to requests
+		resp, err := http.Get(startResult.Address + "/users/123e4567-e89b-12d3-a456-426614174000")
+		if err != nil {
+			t.Errorf("failed to make request to started mock: %v", err)
+		} else {
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("expected status 200 from mock server, got: %d", resp.StatusCode)
+			}
+		}
+	}
+
+	// 4. Test mock stop command on real server
+	outMockStop, err := execCLI(t, testSrv.URL, "mock", "stop", "my-openapi-spec")
+	if err != nil {
+		t.Errorf("real mock stop failed: %v, output: %s", err, outMockStop)
+	}
+	if !strings.Contains(outMockStop, "Status: 200") || !strings.Contains(outMockStop, `"status":"stopped"`) {
+		t.Errorf("expected success stop response, got: %s", outMockStop)
 	}
 }

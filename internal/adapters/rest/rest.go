@@ -337,7 +337,7 @@ func (a *Adapter) translateSchema(schemaRef *openapi3.SchemaRef) (*core.Schema, 
 
 // GenerateMock satisfies the core.ProtocolAdapter interface.
 func (a *Adapter) GenerateMock(spec *core.NormalizedSpec, config core.MockConfig) (core.RunnableMock, error) {
-	return nil, errors.New("mock generation not implemented for REST adapter")
+	return NewMockServer(spec, config), nil
 }
 
 // RunContractChecks satisfies the core.ProtocolAdapter interface.

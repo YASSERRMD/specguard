@@ -129,8 +129,6 @@ func TestServer_NotImplementedRoutes(t *testing.T) {
 		method string
 		path   string
 	}{
-		{"POST", "/api/mocks/start"},
-		{"POST", "/api/mocks/stop"},
 		{"POST", "/api/contract/run"},
 	}
 
@@ -204,5 +202,94 @@ func TestServer_Reports(t *testing.T) {
 	respNonExistent := wNonExistent.Result()
 	if respNonExistent.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 Not Found, got %d", respNonExistent.StatusCode)
+	}
+}
+
+func TestServer_MockManagement(t *testing.T) {
+	srv, dbStore := newTestServer(t)
+	defer dbStore.Close()
+
+	// 1. Upload a spec
+	rawOpenAPI := `
+openapi: 3.0.3
+info:
+  title: Test Spec
+  version: 1.0.0
+paths:
+  /hello:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  msg:
+                    type: string
+`
+	uploadReq := uploadSpecRequest{
+		ID:  "hello-spec",
+		Raw: rawOpenAPI,
+	}
+	data, _ := json.Marshal(uploadReq)
+	req := httptest.NewRequest("POST", "/api/specs", bytes.NewReader(data))
+	w := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to upload spec: %d", w.Code)
+	}
+
+	// 2. Start mock server
+	startReq := mockRequest{
+		ID: "hello-spec",
+	}
+	startData, _ := json.Marshal(startReq)
+	reqStart := httptest.NewRequest("POST", "/api/mocks/start", bytes.NewReader(startData))
+	wStart := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wStart, reqStart)
+
+	if wStart.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK starting mock, got %d. Body: %s", wStart.Code, wStart.Body.String())
+	}
+
+	var startResp map[string]string
+	_ = json.NewDecoder(wStart.Body).Decode(&startResp)
+	if startResp["status"] != "started" || startResp["address"] == "" {
+		t.Fatalf("unexpected start response: %v", startResp)
+	}
+
+	mockAddr := startResp["address"]
+
+	// 3. Make request to the mock server
+	resp, err := http.Get(mockAddr + "/hello")
+	if err != nil {
+		t.Fatalf("failed to GET mock: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected mock to return 200, got %d", resp.StatusCode)
+	}
+
+	// 4. Stop mock server
+	reqStop := httptest.NewRequest("POST", "/api/mocks/stop", bytes.NewReader(startData))
+	wStop := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wStop, reqStop)
+
+	if wStop.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK stopping mock, got %d", wStop.Code)
+	}
+
+	var stopResp map[string]string
+	_ = json.NewDecoder(wStop.Body).Decode(&stopResp)
+	if stopResp["status"] != "stopped" {
+		t.Errorf("unexpected stop response: %v", stopResp)
+	}
+
+	// 5. Verify mock is no longer reachable
+	_, err = http.Get(mockAddr + "/hello")
+	if err == nil {
+		t.Error("expected error GETting stopped mock server, but it succeeded")
 	}
 }
