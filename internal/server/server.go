@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/YASSERRMD/specguard/internal/adapters/rest"
@@ -18,10 +19,12 @@ import (
 
 // Server coordinates HTTP API requests.
 type Server struct {
-	config *Config
-	store  store.Store
-	logger *slog.Logger
-	server *http.Server
+	config  *Config
+	store   store.Store
+	logger  *slog.Logger
+	server  *http.Server
+	mocks   map[string]core.RunnableMock
+	mocksMu sync.Mutex
 }
 
 // NewServer creates a configured HTTP API server instance.
@@ -34,6 +37,7 @@ func NewServer(cfg *Config, dbStore store.Store, logger *slog.Logger) *Server {
 		config: cfg,
 		store:  dbStore,
 		logger: logger,
+		mocks:  make(map[string]core.RunnableMock),
 	}
 
 	mux := http.NewServeMux()
@@ -74,6 +78,12 @@ func (s *Server) Handler() http.Handler {
 // Stop gracefully shuts down the server.
 func (s *Server) Stop(ctx context.Context) error {
 	s.logger.Info("shutting down server")
+	s.mocksMu.Lock()
+	for id, m := range s.mocks {
+		s.logger.Info("stopping active mock server", "id", id)
+		_ = m.Stop()
+	}
+	s.mocksMu.Unlock()
 	return s.server.Shutdown(ctx)
 }
 
@@ -169,12 +179,71 @@ func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type mockRequest struct {
+	ID string `json:"id"`
+}
+
 func (s *Server) handleMocksStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	s.writeError(w, http.StatusNotImplemented, "protocol-specific mock engine not implemented")
+
+	var req mockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.ID == "" {
+		s.writeError(w, http.StatusBadRequest, "Missing spec id")
+		return
+	}
+
+	spec, err := s.store.LoadSpec(req.ID)
+	if err != nil {
+		s.logger.Error("failed to load spec for mock", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("Specification %q not found", req.ID))
+		return
+	}
+
+	mockCfg, err := s.store.LoadMockConfig(req.ID)
+	if err != nil {
+		mockCfg = &core.MockConfig{
+			Host: "127.0.0.1",
+			Port: 0,
+		}
+	}
+
+	s.mocksMu.Lock()
+	defer s.mocksMu.Unlock()
+
+	if existing, running := s.mocks[req.ID]; running {
+		_ = existing.Stop()
+		delete(s.mocks, req.ID)
+	}
+
+	adapter := rest.NewAdapter()
+	runnableMock, err := adapter.GenerateMock(spec, *mockCfg)
+	if err != nil {
+		s.logger.Error("failed to generate mock server", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to generate mock: %v", err))
+		return
+	}
+
+	if err := runnableMock.Start(); err != nil {
+		s.logger.Error("failed to start mock server", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to start mock: %v", err))
+		return
+	}
+
+	s.mocks[req.ID] = runnableMock
+
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"id":      req.ID,
+		"status":  "started",
+		"address": runnableMock.GetAddress(),
+	})
 }
 
 func (s *Server) handleMocksStop(w http.ResponseWriter, r *http.Request) {
@@ -182,7 +251,39 @@ func (s *Server) handleMocksStop(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	s.writeError(w, http.StatusNotImplemented, "protocol-specific mock engine not implemented")
+
+	var req mockRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.ID == "" {
+		s.writeError(w, http.StatusBadRequest, "Missing spec id")
+		return
+	}
+
+	s.mocksMu.Lock()
+	defer s.mocksMu.Unlock()
+
+	runnableMock, running := s.mocks[req.ID]
+	if !running {
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("No running mock server found for spec %q", req.ID))
+		return
+	}
+
+	if err := runnableMock.Stop(); err != nil {
+		s.logger.Error("failed to stop mock server", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to stop mock: %v", err))
+		return
+	}
+
+	delete(s.mocks, req.ID)
+
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"id":     req.ID,
+		"status": "stopped",
+	})
 }
 
 func (s *Server) handleContractRun(w http.ResponseWriter, r *http.Request) {
