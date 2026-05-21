@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  specguard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SPECGUARD_PORT=8080
+      - SPECGUARD_DB_DSN=/data/specguard.db
+      - SPECGUARD_LOG_LEVEL=info
+      - SPECGUARD_API_KEY=my_secure_api_key
+    volumes:
+      - specguard-data:/data
+    restart: unless-stopped
+
+volumes:
+  specguard-data:
