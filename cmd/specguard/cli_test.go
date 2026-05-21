@@ -273,3 +273,80 @@ func TestCLI_IntegrationWithRealServer(t *testing.T) {
 		t.Errorf("expected success stop response, got: %s", outMockStop)
 	}
 }
+
+func TestCLI_HashAndDiff(t *testing.T) {
+	specA := `
+openapi: 3.0.0
+info:
+  title: API A
+  version: 1.0.0
+paths:
+  /users:
+    get:
+      summary: Get users
+      operationId: getUsers
+      responses:
+        '200':
+          description: Success
+`
+
+	specB := `
+openapi: 3.0.0
+info:
+  title: API B
+  version: 1.0.0
+paths:
+  /users:
+    get:
+      summary: Get users
+      operationId: getUsers
+      responses:
+        '200':
+          description: Success
+    post:
+      summary: Create user
+      operationId: createUser
+      responses:
+        '201':
+          description: Created
+`
+
+	tmpA, err := os.CreateTemp("", "specA-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpA.Name())
+	_, _ = tmpA.Write([]byte(specA))
+	tmpA.Close()
+
+	tmpB, err := os.CreateTemp("", "specB-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpB.Name())
+	_, _ = tmpB.Write([]byte(specB))
+	tmpB.Close()
+
+	// 1. Test hash command
+	outHash, err := execCLI(t, "http://localhost", "hash", tmpA.Name())
+	if err != nil {
+		t.Fatalf("hash command failed: %v, output: %s", err, outHash)
+	}
+	words := strings.Fields(outHash)
+	if len(words) == 0 {
+		t.Fatal("empty output from hash command")
+	}
+	hashVal := words[0]
+	if len(hashVal) != 64 {
+		t.Errorf("expected 64-character hex hash, got: %s (len: %d), full output: %q", hashVal, len(hashVal), outHash)
+	}
+
+	// 2. Test diff command
+	outDiff, err := execCLI(t, "http://localhost", "diff", tmpA.Name(), tmpB.Name())
+	if err != nil {
+		t.Fatalf("diff command failed: %v, output: %s", err, outDiff)
+	}
+	if !strings.Contains(outDiff, "createUser") || !strings.Contains(outDiff, "added") {
+		t.Errorf("expected drift report output containing added createUser operation, got: %s", outDiff)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YASSERRMD/specguard/internal/adapters/rest"
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/YASSERRMD/specguard/internal/server"
 	"github.com/YASSERRMD/specguard/internal/store"
@@ -68,6 +69,12 @@ func main() {
 	case "report":
 		handleReportCmd()
 
+	case "hash":
+		handleHashCmd()
+
+	case "diff":
+		handleDiffCmd()
+
 	default:
 		printUsage()
 		os.Exit(1)
@@ -84,6 +91,8 @@ func printUsage() {
 	fmt.Println("  mock stop <id>            Stop a mock server for a spec")
 	fmt.Println("  contract run <id> <url>   Run contract checks against a SUT")
 	fmt.Println("  report show <run_id>      Show drift report findings")
+	fmt.Println("  hash <file>               Generate structural hash of a spec")
+	fmt.Println("  diff <spec-a> <spec-b>    Show structural drift between two specs")
 	fmt.Println("  version                   Print the CLI version")
 }
 
@@ -338,4 +347,68 @@ func handleReportCmd() {
 	}
 
 	fmt.Printf("Report (Status %d):\n%s\n", status, string(resp))
+}
+
+func loadSpecFromFile(filePath string) (*core.NormalizedSpec, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	var spec core.NormalizedSpec
+	if err := json.Unmarshal(content, &spec); err == nil && len(spec.Operations) > 0 {
+		return &spec, nil
+	}
+
+	adapter := rest.NewAdapter()
+	return adapter.LoadSpec(content)
+}
+
+func handleHashCmd() {
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: specguard hash <spec-file>")
+		os.Exit(1)
+	}
+	filePath := os.Args[2]
+	spec, err := loadSpecFromFile(filePath)
+	if err != nil {
+		fmt.Printf("Error loading specification: %v\n", err)
+		os.Exit(1)
+	}
+	hashVal, err := core.HashSpec(spec)
+	if err != nil {
+		fmt.Printf("Error computing spec hash: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(hashVal)
+}
+
+func handleDiffCmd() {
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: specguard diff <spec-a> <spec-b>")
+		os.Exit(1)
+	}
+	fileA := os.Args[2]
+	fileB := os.Args[3]
+	specA, err := loadSpecFromFile(fileA)
+	if err != nil {
+		fmt.Printf("Error loading specification A: %v\n", err)
+		os.Exit(1)
+	}
+	specB, err := loadSpecFromFile(fileB)
+	if err != nil {
+		fmt.Printf("Error loading specification B: %v\n", err)
+		os.Exit(1)
+	}
+	report, err := core.DiffSpecs(specA, specB)
+	if err != nil {
+		fmt.Printf("Error computing spec diff: %v\n", err)
+		os.Exit(1)
+	}
+	out, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fmt.Printf("Error serializing drift report: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
 }
