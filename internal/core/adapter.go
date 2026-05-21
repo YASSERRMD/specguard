@@ -17,10 +17,13 @@ type ProtocolAdapter interface {
 
 // MockConfig holds configurations for setting up mock servers.
 type MockConfig struct {
-	Port           int                    `json:"port"`
-	Host           string                 `json:"host"`
-	ProtocolConfig map[string]interface{} `json:"protocol_config,omitempty"`
-	Chaos          *ChaosConfig           `json:"chaos,omitempty"`
+	ID                 string                 `json:"id,omitempty"`
+	Port               int                    `json:"port"`
+	Host               string                 `json:"host"`
+	ProtocolConfig     map[string]interface{} `json:"protocol_config,omitempty"`
+	Chaos              *ChaosConfig           `json:"chaos,omitempty"`
+	RateLimit          float64                `json:"rate_limit,omitempty"`
+	MaxRequestBodySize int64                  `json:"max_request_body_size,omitempty"`
 }
 
 // ChaosConfig defines parameters for fault and chaos injection.
