@@ -292,8 +292,8 @@ func handleMockCmd() {
 }
 
 func handleContractCmd() {
-	if len(os.Args) < 5 {
-		fmt.Println("Usage: specguard contract run <id> <url>")
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: specguard contract run <id> <url> [--format <text|json|junit>]")
 		os.Exit(1)
 	}
 
@@ -303,8 +303,11 @@ func handleContractCmd() {
 		os.Exit(1)
 	}
 
-	id := os.Args[3]
-	targetURL := os.Args[4]
+	id, targetURL, format, _ := parseContractRunArgs(os.Args[3:])
+	if id == "" || targetURL == "" {
+		fmt.Println("Usage: specguard contract run <id> <url> [--format <text|json|junit>]")
+		os.Exit(1)
+	}
 
 	payload := map[string]string{"id": id, "target_url": targetURL}
 	resp, status, err := makeRequest("POST", "/api/contract/run", payload)
@@ -320,7 +323,78 @@ func handleContractCmd() {
 		os.Exit(0) // Exit 0 for Phase 4 stubs as specified
 	}
 
-	fmt.Printf("Status: %d, Response: %s\n", status, string(resp))
+	if status != http.StatusOK {
+		fmt.Printf("API request failed with status %d: %s\n", status, string(resp))
+		os.Exit(1)
+	}
+
+	var apiResp struct {
+		RunID       string            `json:"run_id"`
+		Status      string            `json:"status"`
+		Passed      bool              `json:"passed"`
+		DriftReport *core.DriftReport `json:"drift_report"`
+	}
+	if err := json.Unmarshal(resp, &apiResp); err != nil {
+		fmt.Printf("Error decoding response: %v\n", err)
+		os.Exit(1)
+	}
+
+	var findings []core.Finding
+	if apiResp.DriftReport != nil {
+		findings = apiResp.DriftReport.Findings
+	}
+
+	switch format {
+	case "json":
+		outMap := map[string]interface{}{
+			"run_id":   apiResp.RunID,
+			"passed":   apiResp.Passed,
+			"findings": findings,
+		}
+		jsonBytes, err := json.MarshalIndent(outMap, "", "  ")
+		if err != nil {
+			fmt.Printf("Error encoding JSON output: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(jsonBytes))
+
+	case "junit":
+		xmlStr := convertToJUnit(id, apiResp.Passed, findings)
+		fmt.Println(xmlStr)
+
+	case "text":
+		fmt.Printf("Contract run completed.\n")
+		if apiResp.Passed {
+			fmt.Printf("Status: PASSED\n")
+		} else {
+			fmt.Printf("Status: FAILED\n")
+		}
+		fmt.Printf("Run ID: %s\n", apiResp.RunID)
+		fmt.Printf("Target: %s\n\n", targetURL)
+
+		if len(findings) == 0 {
+			fmt.Printf("No drift or validation errors found.\n")
+		} else {
+			fmt.Printf("Findings:\n")
+			for _, f := range findings {
+				fmt.Printf("- Location: %s\n", f.Location)
+				fmt.Printf("  Kind:     %s\n", f.Kind)
+				fmt.Printf("  Expected: %s\n", f.Expected)
+				fmt.Printf("  Actual:   %s\n", f.Actual)
+				fmt.Printf("  Severity: %s\n", f.Severity)
+			}
+		}
+
+	default:
+		fmt.Printf("Unknown format %q. Supported formats: text, json, junit.\n", format)
+		os.Exit(1)
+	}
+
+	if apiResp.Passed {
+		os.Exit(0)
+	} else {
+		os.Exit(1)
+	}
 }
 
 func handleReportCmd() {
@@ -419,4 +493,112 @@ func handleDiffCmd() {
 		os.Exit(1)
 	}
 	fmt.Println(string(out))
+}
+
+func parseContractRunArgs(args []string) (id string, targetURL string, format string, cleanArgs []string) {
+	format = "text"
+	cleanArgs = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--format" || arg == "-format" {
+			if i+1 < len(args) {
+				format = args[i+1]
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--format=") {
+			format = strings.TrimPrefix(arg, "--format=")
+		} else if strings.HasPrefix(arg, "-format=") {
+			format = strings.TrimPrefix(arg, "-format=")
+		} else {
+			cleanArgs = append(cleanArgs, arg)
+		}
+	}
+	if len(cleanArgs) >= 1 {
+		id = cleanArgs[0]
+	}
+	if len(cleanArgs) >= 2 {
+		targetURL = cleanArgs[1]
+	}
+	return
+}
+
+func escapeXML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&apos;")
+	return s
+}
+
+func convertToJUnit(specID string, passed bool, findings []core.Finding) string {
+	var sb strings.Builder
+	sb.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+
+	opFindings := make(map[string][]core.Finding)
+	if len(findings) == 0 {
+		sb.WriteString("<testsuites name=\"specguard-contract\" tests=\"1\" failures=\"0\" errors=\"0\" time=\"0.0\">\n")
+		sb.WriteString(fmt.Sprintf("  <testsuite name=\"%s\" tests=\"1\" failures=\"0\" errors=\"0\" time=\"0.0\">\n", specID))
+		sb.WriteString(fmt.Sprintf("    <testcase name=\"contract-run\" className=\"specguard.%s\" time=\"0.0\"/>\n", specID))
+		sb.WriteString("  </testsuite>\n")
+		sb.WriteString("</testsuites>\n")
+		return sb.String()
+	}
+
+	for _, f := range findings {
+		opName := "general"
+		if strings.HasPrefix(f.Location, "operations.") {
+			parts := strings.Split(f.Location, ".")
+			if len(parts) > 1 {
+				opName = parts[1]
+			}
+		}
+		opFindings[opName] = append(opFindings[opName], f)
+	}
+
+	totalTests := len(opFindings)
+	totalFailures := 0
+	for _, fs := range opFindings {
+		hasError := false
+		for _, f := range fs {
+			if f.Severity == core.SeverityError {
+				hasError = true
+				break
+			}
+		}
+		if hasError {
+			totalFailures++
+		}
+	}
+	if totalFailures == 0 && len(findings) > 0 {
+		totalFailures = len(opFindings)
+	}
+
+	sb.WriteString(fmt.Sprintf("<testsuites name=\"specguard-contract\" tests=\"%d\" failures=\"%d\" errors=\"0\" time=\"0.0\">\n", totalTests, totalFailures))
+	sb.WriteString(fmt.Sprintf("  <testsuite name=\"%s\" tests=\"%d\" failures=\"%d\" errors=\"0\" time=\"0.0\">\n", specID, totalTests, totalFailures))
+
+	for opName, fs := range opFindings {
+		sb.WriteString(fmt.Sprintf("    <testcase name=\"%s\" className=\"specguard.%s\" time=\"0.0\">\n", opName, specID))
+		for _, f := range fs {
+			msg := fmt.Sprintf("Drift detected: %s (Expected: %s, Actual: %s)", f.Kind, f.Expected, f.Actual)
+			escapedMsg := escapeXML(msg)
+			escapedLoc := escapeXML(f.Location)
+			escapedExpected := escapeXML(f.Expected)
+			escapedActual := escapeXML(f.Actual)
+			escapedSeverity := escapeXML(string(f.Severity))
+			escapedKind := escapeXML(string(f.Kind))
+
+			sb.WriteString(fmt.Sprintf("      <failure message=\"%s\" type=\"%s\">\n", escapedMsg, escapedKind))
+			sb.WriteString(fmt.Sprintf("        Location: %s\n", escapedLoc))
+			sb.WriteString(fmt.Sprintf("        Severity: %s\n", escapedSeverity))
+			sb.WriteString(fmt.Sprintf("        Expected: %s\n", escapedExpected))
+			sb.WriteString(fmt.Sprintf("        Actual:   %s\n", escapedActual))
+			sb.WriteString("      </failure>\n")
+		}
+		sb.WriteString("    </testcase>\n")
+	}
+
+	sb.WriteString("  </testsuite>\n")
+	sb.WriteString("</testsuites>\n")
+	return sb.String()
 }
