@@ -43,14 +43,31 @@ func NewServer(cfg *Config, dbStore store.Store, logger *slog.Logger) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/api/specs", srv.handleSpecs)
+	mux.HandleFunc("/api/mocks", srv.handleMocksList)
+	mux.HandleFunc("/api/mocks/config", srv.handleMocksConfig)
 	mux.HandleFunc("/api/mocks/start", srv.handleMocksStart)
 	mux.HandleFunc("/api/mocks/stop", srv.handleMocksStop)
 	mux.HandleFunc("/api/contract/run", srv.handleContractRun)
 	mux.HandleFunc("/api/reports/", srv.handleReports)
 
+	// Serve the static web dashboard assets if built
+	if _, err := os.Stat("web/dist"); err == nil {
+		mux.Handle("/", http.FileServer(http.Dir("web/dist")))
+	} else {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`<h1>Specguard API Server</h1><p>Web dashboard assets not built. Run <code>npm run build</code> in <code>web/</code> first.</p>`))
+				return
+			}
+			http.NotFound(w, r)
+		})
+	}
+
 	srv.server = &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: srv.loggingMiddleware(mux),
+		Handler: srv.loggingMiddleware(srv.corsMiddleware(mux)),
 	}
 
 	return srv
@@ -96,6 +113,19 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"duration", time.Since(start),
 		)
+	})
+}
+
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -163,6 +193,18 @@ func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusCreated, map[string]string{"id": req.ID, "status": "saved"})
 
 	case http.MethodGet:
+		id := r.URL.Query().Get("id")
+		if id != "" {
+			spec, err := s.store.LoadSpec(id)
+			if err != nil {
+				s.logger.Error("failed to load spec", "id", id, "error", err)
+				s.writeError(w, http.StatusNotFound, fmt.Sprintf("Specification %q not found", id))
+				return
+			}
+			s.writeJSON(w, http.StatusOK, spec)
+			return
+		}
+
 		specs, err := s.store.ListSpecs()
 		if err != nil {
 			s.logger.Error("failed to list specs", "error", err)
@@ -173,6 +215,67 @@ func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
 			specs = []string{}
 		}
 		s.writeJSON(w, http.StatusOK, specs)
+
+	default:
+		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+	}
+}
+
+func (s *Server) handleMocksList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	s.mocksMu.Lock()
+	defer s.mocksMu.Unlock()
+
+	result := make(map[string]string)
+	for id, m := range s.mocks {
+		result[id] = m.GetAddress()
+	}
+
+	s.writeJSON(w, http.StatusOK, result)
+}
+
+type mockConfigReq struct {
+	ID     string           `json:"id"`
+	Config *core.MockConfig `json:"config"`
+}
+
+func (s *Server) handleMocksConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var req mockConfigReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+			return
+		}
+		if req.ID == "" || req.Config == nil {
+			s.writeError(w, http.StatusBadRequest, "Missing ID or config")
+			return
+		}
+		if err := s.store.SaveMockConfig(req.ID, req.Config); err != nil {
+			s.logger.Error("failed to save mock config", "id", req.ID, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to save mock config")
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+
+	case http.MethodGet:
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			s.writeError(w, http.StatusBadRequest, "Missing id parameter")
+			return
+		}
+		cfg, err := s.store.LoadMockConfig(id)
+		if err != nil {
+			cfg = &core.MockConfig{
+				Host: "127.0.0.1",
+				Port: 0,
+			}
+		}
+		s.writeJSON(w, http.StatusOK, cfg)
 
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -353,10 +456,24 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Route format: /api/reports/{id}
+	// Route format: /api/reports/{id} or /api/reports/?spec_id={spec_id}
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) < 4 || parts[3] == "" {
-		s.writeError(w, http.StatusBadRequest, "Missing report run id")
+		specID := r.URL.Query().Get("spec_id")
+		if specID != "" {
+			runs, err := s.store.ListContractRuns(specID)
+			if err != nil {
+				s.logger.Error("failed to list contract runs", "spec_id", specID, "error", err)
+				s.writeError(w, http.StatusInternalServerError, "Failed to list contract runs")
+				return
+			}
+			if runs == nil {
+				runs = []store.ContractRun{}
+			}
+			s.writeJSON(w, http.StatusOK, runs)
+			return
+		}
+		s.writeError(w, http.StatusBadRequest, "Missing report run id or spec_id query parameter")
 		return
 	}
 	runID := parts[3]

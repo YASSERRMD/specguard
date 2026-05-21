@@ -103,6 +103,21 @@ paths:
 		t.Errorf("expected 201 Created for raw spec, got %d", respRaw.StatusCode)
 	}
 
+	// 2.5 Get single spec details
+	reqGetSingle := httptest.NewRequest("GET", "/api/specs?id=petstore-raw", nil)
+	wGetSingle := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wGetSingle, reqGetSingle)
+	if wGetSingle.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for single spec get, got %d", wGetSingle.Code)
+	}
+	var loadedSpec core.NormalizedSpec
+	if err := json.NewDecoder(wGetSingle.Body).Decode(&loadedSpec); err != nil {
+		t.Errorf("failed to decode single spec: %v", err)
+	}
+	if _, ok := loadedSpec.Operations["getPets"]; !ok {
+		t.Errorf("expected operation getPets in single spec, got: %v", loadedSpec.Operations)
+	}
+
 	// 3. List specs
 	reqList := httptest.NewRequest("GET", "/api/specs", nil)
 	wList := httptest.NewRecorder()
@@ -213,6 +228,39 @@ paths:
 		t.Fatalf("failed to upload spec: %d", w.Code)
 	}
 
+	// 1.5 Test mock config save and load
+	configReqBody := map[string]interface{}{
+		"id": "hello-spec",
+		"config": map[string]interface{}{
+			"host": "127.0.0.1",
+			"port": 9091,
+			"chaos": map[string]interface{}{
+				"latency_ms": 100,
+			},
+		},
+	}
+	configReqBodyBytes, _ := json.Marshal(configReqBody)
+	reqSaveCfg := httptest.NewRequest("POST", "/api/mocks/config", bytes.NewReader(configReqBodyBytes))
+	wSaveCfg := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wSaveCfg, reqSaveCfg)
+	if wSaveCfg.Code != http.StatusOK {
+		t.Errorf("expected 200 OK saving mock config, got %d", wSaveCfg.Code)
+	}
+
+	reqGetCfg := httptest.NewRequest("GET", "/api/mocks/config?id=hello-spec", nil)
+	wGetCfg := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wGetCfg, reqGetCfg)
+	if wGetCfg.Code != http.StatusOK {
+		t.Errorf("expected 200 OK getting mock config, got %d", wGetCfg.Code)
+	}
+	var loadedCfg core.MockConfig
+	if err := json.NewDecoder(wGetCfg.Body).Decode(&loadedCfg); err != nil {
+		t.Errorf("failed to decode mock config: %v", err)
+	}
+	if loadedCfg.Port != 9091 || loadedCfg.Chaos == nil || loadedCfg.Chaos.LatencyMs != 100 {
+		t.Errorf("loaded config properties mismatched: %+v", loadedCfg)
+	}
+
 	// 2. Start mock server
 	startReq := mockRequest{
 		ID: "hello-spec",
@@ -233,6 +281,19 @@ paths:
 	}
 
 	mockAddr := startResp["address"]
+
+	// 2.5 Verify mock list includes the running mock
+	reqListMocks := httptest.NewRequest("GET", "/api/mocks", nil)
+	wListMocks := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wListMocks, reqListMocks)
+	if wListMocks.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for mocks list, got %d", wListMocks.Code)
+	}
+	var mocksList map[string]string
+	_ = json.NewDecoder(wListMocks.Body).Decode(&mocksList)
+	if addr, ok := mocksList["hello-spec"]; !ok || addr != mockAddr {
+		t.Errorf("expected hello-spec in active mocks list with addr %s, got %v", mockAddr, mocksList)
+	}
 
 	// 3. Make request to the mock server
 	resp, err := http.Get(mockAddr + "/hello")
@@ -346,5 +407,30 @@ paths:
 	}
 	if !loadedRun.Passed {
 		t.Errorf("expected loaded run to pass")
+	}
+
+	// 5. Test GET /api/reports/{id}
+	reqReport := httptest.NewRequest("GET", "/api/reports/"+runID, nil)
+	wReport := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wReport, reqReport)
+	if wReport.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for report retrieval, got %d", wReport.Code)
+	}
+
+	// 6. Test GET /api/reports/?spec_id={spec_id}
+	reqListReports := httptest.NewRequest("GET", "/api/reports/?spec_id=hello-spec", nil)
+	wListReports := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wListReports, reqListReports)
+	if wListReports.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for reports list, got %d", wListReports.Code)
+	}
+	var historyList []store.ContractRun
+	if err := json.NewDecoder(wListReports.Body).Decode(&historyList); err != nil {
+		t.Errorf("failed to decode history: %v", err)
+	}
+	if len(historyList) == 0 {
+		t.Errorf("expected at least one contract run, got 0")
+	} else if historyList[0].ID != runID {
+		t.Errorf("expected ID %s in history, got %s", runID, historyList[0].ID)
 	}
 }
