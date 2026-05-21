@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ func NewServer(cfg *Config, dbStore store.Store, logger *slog.Logger) *Server {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", srv.handleHealth)
+	mux.HandleFunc("/metrics", srv.handleMetrics)
 	mux.HandleFunc("/api/specs", srv.handleSpecs)
 	mux.HandleFunc("/api/mocks", srv.handleMocksList)
 	mux.HandleFunc("/api/mocks/config", srv.handleMocksConfig)
@@ -68,7 +70,7 @@ func NewServer(cfg *Config, dbStore store.Store, logger *slog.Logger) *Server {
 
 	srv.server = &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: srv.loggingMiddleware(srv.corsMiddleware(mux)),
+		Handler: srv.loggingMiddleware(srv.corsMiddleware(srv.authMiddleware(mux))),
 	}
 
 	return srv
@@ -101,19 +103,65 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.logger.Info("stopping active mock server", "id", id)
 		_ = m.Stop()
 	}
+	s.mocks = make(map[string]core.RunnableMock)
+	core.Metrics.SetActiveMocks(0)
 	s.mocksMu.Unlock()
 	return s.server.Shutdown(ctx)
+}
+
+type serverResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (srw *serverResponseWriter) WriteHeader(code int) {
+	srw.statusCode = code
+	srw.ResponseWriter.WriteHeader(code)
+}
+
+func (srw *serverResponseWriter) Write(b []byte) (int, error) {
+	if srw.statusCode == 0 {
+		srw.statusCode = http.StatusOK
+	}
+	return srw.ResponseWriter.Write(b)
 }
 
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
+		srw := &serverResponseWriter{ResponseWriter: w}
+		next.ServeHTTP(srw, r)
+
+		statusCode := srw.statusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+
+		duration := time.Since(start)
 		s.logger.Info("request processed",
 			"method", r.Method,
 			"path", r.URL.Path,
-			"duration", time.Since(start),
+			"status", statusCode,
+			"duration", duration,
 		)
+
+		// Record HTTP API metrics
+		statusStr := strconv.Itoa(statusCode)
+		core.Metrics.RecordHTTPRequest(r.Method, r.URL.Path, statusStr)
+	})
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.APIKey != "" && strings.HasPrefix(r.URL.Path, "/api/") {
+			authHeader := r.Header.Get("Authorization")
+			expected := "Bearer " + s.config.APIKey
+			if authHeader != expected {
+				s.writeError(w, http.StatusUnauthorized, "Unauthorized: invalid or missing API key")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -359,6 +407,7 @@ func (s *Server) handleMocksStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mocks[req.ID] = runnableMock
+	core.Metrics.SetActiveMocks(int64(len(s.mocks)))
 
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"id":      req.ID,
@@ -400,6 +449,7 @@ func (s *Server) handleMocksStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	delete(s.mocks, req.ID)
+	core.Metrics.SetActiveMocks(int64(len(s.mocks)))
 
 	s.writeJSON(w, http.StatusOK, map[string]string{
 		"id":     req.ID,
@@ -514,4 +564,18 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, run.DriftReport)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	s.mocksMu.Lock()
+	core.Metrics.SetActiveMocks(int64(len(s.mocks)))
+	s.mocksMu.Unlock()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(core.Metrics.FormatPrometheus()))
 }
