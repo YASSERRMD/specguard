@@ -286,12 +286,65 @@ func (s *Server) handleMocksStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type contractRunRequest struct {
+	ID        string `json:"id"`
+	TargetURL string `json:"target_url"`
+}
+
 func (s *Server) handleContractRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
-	s.writeError(w, http.StatusNotImplemented, "protocol-specific contract runner not implemented")
+
+	var req contractRunRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.ID == "" || req.TargetURL == "" {
+		s.writeError(w, http.StatusBadRequest, "Missing spec id or target_url")
+		return
+	}
+
+	spec, err := s.store.LoadSpec(req.ID)
+	if err != nil {
+		s.logger.Error("failed to load spec for contract run", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusNotFound, fmt.Sprintf("Specification %q not found", req.ID))
+		return
+	}
+
+	adapter := rest.NewAdapter()
+	result, err := adapter.RunContractChecks(spec, req.TargetURL)
+	if err != nil {
+		s.logger.Error("contract validation failed with execution error", "id", req.ID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("Contract check error: %v", err))
+		return
+	}
+
+	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	run := &store.ContractRun{
+		ID:          runID,
+		SpecID:      req.ID,
+		TargetURL:   req.TargetURL,
+		Passed:      result.Passed,
+		DriftReport: result.DriftReport,
+		CreatedAt:   time.Now(),
+	}
+
+	if err := s.store.SaveContractRun(run); err != nil {
+		s.logger.Error("failed to save contract run details", "id", req.ID, "run_id", runID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "Failed to save contract run details")
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"run_id":       runID,
+		"status":       "completed",
+		"passed":       result.Passed,
+		"drift_report": result.DriftReport,
+	})
 }
 
 func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
