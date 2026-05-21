@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/YASSERRMD/specguard/internal/core"
@@ -122,34 +121,7 @@ paths:
 }
 
 func TestServer_NotImplementedRoutes(t *testing.T) {
-	srv, dbStore := newTestServer(t)
-	defer dbStore.Close()
-
-	routes := []struct {
-		method string
-		path   string
-	}{
-		{"POST", "/api/contract/run"},
-	}
-
-	for _, tc := range routes {
-		t.Run(tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			w := httptest.NewRecorder()
-			srv.server.Handler.ServeHTTP(w, req)
-
-			resp := w.Result()
-			if resp.StatusCode != http.StatusNotImplemented {
-				t.Errorf("expected 501 Not Implemented, got %d", resp.StatusCode)
-			}
-
-			var body map[string]string
-			_ = json.NewDecoder(resp.Body).Decode(&body)
-			if !strings.Contains(body["error"], "not implemented") {
-				t.Errorf("expected error message containing 'not implemented', got %s", body["error"])
-			}
-		})
-	}
+	// All API endpoints are now fully implemented in Phase 10.
 }
 
 func TestServer_Reports(t *testing.T) {
@@ -291,5 +263,88 @@ paths:
 	_, err = http.Get(mockAddr + "/hello")
 	if err == nil {
 		t.Error("expected error GETting stopped mock server, but it succeeded")
+	}
+}
+
+func TestServer_ContractRun(t *testing.T) {
+	srv, dbStore := newTestServer(t)
+	defer dbStore.Close()
+
+	// 1. Upload a spec
+	rawOpenAPI := `
+openapi: 3.0.3
+info:
+  title: Test Spec
+  version: 1.0.0
+paths:
+  /hello:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - msg
+                properties:
+                  msg:
+                    type: string
+`
+	uploadReq := uploadSpecRequest{
+		ID:  "hello-spec",
+		Raw: rawOpenAPI,
+	}
+	data, _ := json.Marshal(uploadReq)
+	req := httptest.NewRequest("POST", "/api/specs", bytes.NewReader(data))
+	w := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to upload spec: %d", w.Code)
+	}
+
+	// 2. Start a mock SUT
+	sutMux := http.NewServeMux()
+	sutMux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"msg":"world"}`))
+	})
+	sutSrv := httptest.NewServer(sutMux)
+	defer sutSrv.Close()
+
+	// 3. Trigger contract run
+	runReq := contractRunRequest{
+		ID:        "hello-spec",
+		TargetURL: sutSrv.URL,
+	}
+	runData, _ := json.Marshal(runReq)
+	reqRun := httptest.NewRequest("POST", "/api/contract/run", bytes.NewReader(runData))
+	wRun := httptest.NewRecorder()
+	srv.server.Handler.ServeHTTP(wRun, reqRun)
+
+	if wRun.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d. Body: %s", wRun.Code, wRun.Body.String())
+	}
+
+	var runResp map[string]interface{}
+	_ = json.NewDecoder(wRun.Body).Decode(&runResp)
+	if runResp["status"] != "completed" || runResp["passed"] != true {
+		t.Errorf("unexpected run response: %v", runResp)
+	}
+
+	runID, ok := runResp["run_id"].(string)
+	if !ok || runID == "" {
+		t.Fatalf("expected run_id, got nil")
+	}
+
+	// 4. Verify run was saved to store
+	loadedRun, err := dbStore.GetContractRun(runID)
+	if err != nil {
+		t.Fatalf("failed to load contract run: %v", err)
+	}
+	if !loadedRun.Passed {
+		t.Errorf("expected loaded run to pass")
 	}
 }
