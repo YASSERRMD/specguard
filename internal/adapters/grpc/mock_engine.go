@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"strconv"
@@ -141,53 +142,25 @@ func (m *MockServer) GetAddress() string {
 	return m.address
 }
 
-func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) error {
-	ctx := stream.Context()
-	methodPath, ok := grpc.Method(ctx)
-	if !ok {
-		return status.Error(codes.Internal, "failed to get method from context")
-	}
-
-	op, opExists := m.spec.Operations[methodPath]
-	if !opExists {
-		return status.Errorf(codes.Unimplemented, "method %q not found in mock spec", methodPath)
-	}
-
-	methodDesc, descExists := m.methods[methodPath]
-	if !descExists {
-		return status.Errorf(codes.Unimplemented, "descriptor for %q not found", methodPath)
-	}
-
-	// 1. Evaluate Chaos Injection
-	if triggered, err := m.evaluateChaos(stream); triggered {
-		return err
-	}
-
-	// 2. Decode incoming payload
-	inDesc := methodDesc.Input()
-	inMsg := dynamicpb.NewMessage(inDesc)
-	if err := stream.RecvMsg(inMsg); err != nil {
-		return err
-	}
-
+func (m *MockServer) processMessageAndValidate(ctx context.Context, op core.Operation, methodDesc protoreflect.MethodDescriptor, inMsg *dynamicpb.Message, stream grpc.ServerStream) (*dynamicpb.Message, error) {
 	// Convert incoming msg to standard map[string]interface{} using JSON translation
 	mOpts := protojson.MarshalOptions{UseProtoNames: true}
 	jsonBytes, err := mOpts.Marshal(inMsg)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to marshal request message: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to marshal request message: %v", err)
 	}
 
 	var val interface{}
 	if err := json.Unmarshal(jsonBytes, &val); err != nil {
-		return status.Errorf(codes.Internal, "failed to parse request JSON: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to parse request JSON: %v", err)
 	}
 
-	// 3. Validate against schema
+	// Validate against schema
 	if err := op.Input.Match(val); err != nil {
-		return status.Errorf(codes.InvalidArgument, "validation failed: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "validation failed: %v", err)
 	}
 
-	// 4. Retrieve scenario selection
+	// Retrieve scenario selection
 	scenarioName := ""
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if vals := md.Get("x-mock-scenario"); len(vals) > 0 {
@@ -217,7 +190,7 @@ func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) err
 			md.Set(k, fmt.Sprintf("%v", v))
 		}
 		if err := stream.SendHeader(md); err != nil {
-			return status.Errorf(codes.Internal, "failed to send metadata headers: %v", err)
+			return nil, status.Errorf(codes.Internal, "failed to send metadata headers: %v", err)
 		}
 	}
 
@@ -232,18 +205,18 @@ func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) err
 			} else if sMsg, ok := respBody.(string); ok {
 				errMsg = sMsg
 			}
-			return status.Error(gCode, errMsg)
+			return nil, status.Error(gCode, errMsg)
 		}
 	}
 
-	// 5. Generate mock output values
+	// Generate mock output values
 	var mockVal interface{}
 	if hasScenario && respBody != nil {
 		mockVal = respBody
 	} else {
 		successSchema, ok := op.Output.Properties["0"]
 		if !ok {
-			return status.Errorf(codes.Internal, "missing success schema for method %s", methodPath)
+			return nil, status.Errorf(codes.Internal, "missing success schema for method %s", methodDesc.FullName())
 		}
 		mockVal = generateMockValue(successSchema)
 	}
@@ -251,17 +224,156 @@ func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) err
 	// Serialize mock values to JSON and load into dynamic pb message
 	respJSON, err := json.Marshal(mockVal)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to marshal mock response: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to marshal mock response: %v", err)
 	}
 
 	outDesc := methodDesc.Output()
 	outMsg := dynamicpb.NewMessage(outDesc)
 	uOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
 	if err := uOpts.Unmarshal(respJSON, outMsg); err != nil {
-		return status.Errorf(codes.Internal, "failed to unmarshal mock payload to proto: %v", err)
+		return nil, status.Errorf(codes.Internal, "failed to unmarshal mock payload to proto: %v", err)
 	}
 
-	return stream.SendMsg(outMsg)
+	return outMsg, nil
+}
+
+func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) error {
+	ctx := stream.Context()
+	methodPath, ok := grpc.Method(ctx)
+	if !ok {
+		return status.Error(codes.Internal, "failed to get method from context")
+	}
+
+	op, opExists := m.spec.Operations[methodPath]
+	if !opExists {
+		return status.Errorf(codes.Unimplemented, "method %q not found in mock spec", methodPath)
+	}
+
+	methodDesc, descExists := m.methods[methodPath]
+	if !descExists {
+		return status.Errorf(codes.Unimplemented, "descriptor for %q not found", methodPath)
+	}
+
+	// 1. Evaluate Chaos Injection
+	if triggered, err := m.evaluateChaos(stream); triggered {
+		return err
+	}
+
+	isClientStream := methodDesc.IsStreamingClient()
+	isServerStream := methodDesc.IsStreamingServer()
+
+	if !isClientStream && !isServerStream {
+		// Unary
+		inDesc := methodDesc.Input()
+		inMsg := dynamicpb.NewMessage(inDesc)
+		if err := stream.RecvMsg(inMsg); err != nil {
+			return err
+		}
+
+		respVal, gErr := m.processMessageAndValidate(ctx, op, methodDesc, inMsg, stream)
+		if gErr != nil {
+			return gErr
+		}
+		return stream.SendMsg(respVal)
+	}
+
+	if isClientStream && !isServerStream {
+		// Client Streaming
+		inDesc := methodDesc.Input()
+		var lastMsg *dynamicpb.Message
+		for {
+			inMsg := dynamicpb.NewMessage(inDesc)
+			err := stream.RecvMsg(inMsg)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+
+			// Validate each request
+			mOpts := protojson.MarshalOptions{UseProtoNames: true}
+			jsonBytes, err := mOpts.Marshal(inMsg)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to marshal request message: %v", err)
+			}
+			var val interface{}
+			if err := json.Unmarshal(jsonBytes, &val); err != nil {
+				return status.Errorf(codes.Internal, "failed to parse request JSON: %v", err)
+			}
+			if err := op.Input.Match(val); err != nil {
+				return status.Errorf(codes.InvalidArgument, "validation failed: %v", err)
+			}
+			lastMsg = inMsg
+		}
+
+		if lastMsg == nil {
+			lastMsg = dynamicpb.NewMessage(inDesc)
+		}
+
+		respVal, gErr := m.processMessageAndValidate(ctx, op, methodDesc, lastMsg, stream)
+		if gErr != nil {
+			return gErr
+		}
+		return stream.SendMsg(respVal)
+	}
+
+	if !isClientStream && isServerStream {
+		// Server Streaming
+		inDesc := methodDesc.Input()
+		inMsg := dynamicpb.NewMessage(inDesc)
+		if err := stream.RecvMsg(inMsg); err != nil {
+			return err
+		}
+
+		// Validate request
+		mOpts := protojson.MarshalOptions{UseProtoNames: true}
+		jsonBytes, err := mOpts.Marshal(inMsg)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to marshal request message: %v", err)
+		}
+		var val interface{}
+		if err := json.Unmarshal(jsonBytes, &val); err != nil {
+			return status.Errorf(codes.Internal, "failed to parse request JSON: %v", err)
+		}
+		if err := op.Input.Match(val); err != nil {
+			return status.Errorf(codes.InvalidArgument, "validation failed: %v", err)
+		}
+
+		// Send 2 streaming responses
+		for i := 0; i < 2; i++ {
+			respVal, gErr := m.processMessageAndValidate(ctx, op, methodDesc, inMsg, stream)
+			if gErr != nil {
+				return gErr
+			}
+			if err := stream.SendMsg(respVal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Bidirectional Streaming
+	inDesc := methodDesc.Input()
+	for {
+		inMsg := dynamicpb.NewMessage(inDesc)
+		err := stream.RecvMsg(inMsg)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		respVal, gErr := m.processMessageAndValidate(ctx, op, methodDesc, inMsg, stream)
+		if gErr != nil {
+			return gErr
+		}
+		if err := stream.SendMsg(respVal); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *MockServer) evaluateChaos(stream grpc.ServerStream) (bool, error) {
