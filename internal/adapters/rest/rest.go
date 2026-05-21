@@ -1,10 +1,15 @@
 package rest
 
 import (
-	"errors"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/getkin/kin-openapi/openapi3"
@@ -342,10 +347,245 @@ func (a *Adapter) GenerateMock(spec *core.NormalizedSpec, config core.MockConfig
 
 // RunContractChecks satisfies the core.ProtocolAdapter interface.
 func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string) (core.CheckResult, error) {
-	return core.CheckResult{}, errors.New("contract checks not implemented for REST adapter")
+	report := &core.DriftReport{
+		Findings: []core.Finding{},
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for opID, op := range spec.Operations {
+		method := op.Metadata["method"]
+		pathPattern := op.Metadata["path"]
+		if method == "" || pathPattern == "" {
+			continue
+		}
+
+		actualPath := pathPattern
+		if pathSchema, ok := op.Input.Properties["path"]; ok {
+			pathVals := generateValueForSchema(pathSchema)
+			if m, ok := pathVals.(map[string]interface{}); ok {
+				for name, val := range m {
+					actualPath = strings.Replace(actualPath, "{"+name+"}", fmt.Sprintf("%v", val), -1)
+				}
+			}
+		}
+
+		tURL := strings.TrimSuffix(targetURL, "/")
+		if !strings.HasPrefix(actualPath, "/") {
+			actualPath = "/" + actualPath
+		}
+		reqURL := tURL + actualPath
+
+		if querySchema, ok := op.Input.Properties["query"]; ok {
+			queryVals := generateValueForSchema(querySchema)
+			if m, ok := queryVals.(map[string]interface{}); ok {
+				queryParams := url.Values{}
+				for name, val := range m {
+					queryParams.Set(name, fmt.Sprintf("%v", val))
+				}
+				if len(queryParams) > 0 {
+					reqURL += "?" + queryParams.Encode()
+				}
+			}
+		}
+
+		var bodyReader io.Reader
+		var bodyBytes []byte
+		if bodySchema, ok := op.Input.Properties["body"]; ok {
+			bodyVal := generateValueForSchema(bodySchema)
+			var err error
+			bodyBytes, err = json.Marshal(bodyVal)
+			if err != nil {
+				return core.CheckResult{}, fmt.Errorf("failed to marshal generated body for op %s: %w", opID, err)
+			}
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+
+		req, err := http.NewRequest(method, reqURL, bodyReader)
+		if err != nil {
+			return core.CheckResult{}, fmt.Errorf("failed to create http request for op %s: %w", opID, err)
+		}
+
+		if headerSchema, ok := op.Input.Properties["header"]; ok {
+			headerVals := generateValueForSchema(headerSchema)
+			if m, ok := headerVals.(map[string]interface{}); ok {
+				for name, val := range m {
+					req.Header.Set(name, fmt.Sprintf("%v", val))
+				}
+			}
+		}
+
+		if bodyReader != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			report.Findings = append(report.Findings, core.Finding{
+				Location: "operations." + opID,
+				Kind:     core.KindMissing,
+				Expected: "reachable target",
+				Actual:   "error: " + err.Error(),
+				Severity: core.SeverityError,
+			})
+			continue
+		}
+
+		respBodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			report.Findings = append(report.Findings, core.Finding{
+				Location: "operations." + opID,
+				Kind:     core.KindMissing,
+				Expected: "readable response body",
+				Actual:   "error: " + err.Error(),
+				Severity: core.SeverityError,
+			})
+			continue
+		}
+
+		statusStr := strconv.Itoa(resp.StatusCode)
+
+		var matchSchema *core.Schema
+		var isError bool
+
+		if schema, exists := op.Output.Properties[statusStr]; exists {
+			matchSchema = &schema
+			isError = false
+		} else if schema, exists := op.ErrorShapes[statusStr]; exists {
+			matchSchema = &schema
+			isError = true
+		}
+
+		if matchSchema == nil {
+			report.Findings = append(report.Findings, core.Finding{
+				Location: "operations." + opID + ".output." + statusStr,
+				Kind:     core.KindMissing,
+				Expected: "response status code defined in spec",
+				Actual:   "status " + statusStr,
+				Severity: core.SeverityError,
+			})
+			continue
+		}
+
+		var parsedBody interface{}
+		if len(respBodyBytes) > 0 {
+			if err := json.Unmarshal(respBodyBytes, &parsedBody); err != nil {
+				report.Findings = append(report.Findings, core.Finding{
+					Location: "operations." + opID + ".output." + statusStr,
+					Kind:     core.KindTypeChanged,
+					Expected: "application/json",
+					Actual:   "malformed JSON: " + err.Error(),
+					Severity: core.SeverityError,
+				})
+				continue
+			}
+		}
+
+		if err := matchSchema.Match(parsedBody); err != nil {
+			severity := core.SeverityError
+			if isError {
+				severity = core.SeverityWarning
+			}
+			report.Findings = append(report.Findings, core.Finding{
+				Location: "operations." + opID + ".output." + statusStr,
+				Kind:     core.KindConstraintViolated,
+				Expected: "conformant schema structure",
+				Actual:   err.Error(),
+				Severity: severity,
+			})
+		}
+	}
+
+	passed := len(report.Findings) == 0
+	return core.CheckResult{
+		Passed:      passed,
+		DriftReport: report,
+	}, nil
+}
+
+func generateValueForSchema(s core.Schema) interface{} {
+	switch s.Type {
+	case core.TypeScalar:
+		switch s.ScalarType {
+		case core.ScalarInteger:
+			val := 1
+			for _, c := range s.Constraints {
+				if c.Kind == "min" {
+					if v, err := strconv.Atoi(c.Value); err == nil && val < v {
+						val = v
+					}
+				}
+			}
+			return val
+		case core.ScalarNumber:
+			val := 1.0
+			for _, c := range s.Constraints {
+				if c.Kind == "min" {
+					if v, err := strconv.ParseFloat(c.Value, 64); err == nil && val < v {
+						val = v
+					}
+				}
+			}
+			return val
+		case core.ScalarBoolean:
+			return true
+		case core.ScalarString:
+			for _, c := range s.Constraints {
+				if c.Kind == "format" {
+					if c.Value == "uuid" {
+						return "123e4567-e89b-12d3-a456-426614174000"
+					}
+					if c.Value == "date-time" {
+						return "2026-05-21T06:10:00Z"
+					}
+				}
+			}
+			return "mock_value"
+		default:
+			return "mock_value"
+		}
+	case core.TypeEnum:
+		if len(s.EnumValues) > 0 {
+			return s.EnumValues[0]
+		}
+		return "enum_default"
+	case core.TypeArray:
+		if s.Item != nil {
+			return []interface{}{generateValueForSchema(*s.Item)}
+		}
+		return []interface{}{}
+	case core.TypeObject:
+		res := make(map[string]interface{})
+		for propName, propSchema := range s.Properties {
+			res[propName] = generateValueForSchema(propSchema)
+		}
+		return res
+	default:
+		return nil
+	}
 }
 
 // NormalizeResult satisfies the core.ProtocolAdapter interface.
 func (a *Adapter) NormalizeResult(rawResult interface{}) (*core.DriftReport, error) {
-	return nil, errors.New("normalize result not implemented for REST adapter")
+	switch v := rawResult.(type) {
+	case *core.DriftReport:
+		return v, nil
+	case core.DriftReport:
+		return &v, nil
+	case []byte:
+		var r core.DriftReport
+		if err := json.Unmarshal(v, &r); err != nil {
+			return nil, err
+		}
+		return &r, nil
+	case string:
+		var r core.DriftReport
+		if err := json.Unmarshal([]byte(v), &r); err != nil {
+			return nil, err
+		}
+		return &r, nil
+	default:
+		return nil, fmt.Errorf("unsupported raw result type: %T", rawResult)
+	}
 }
