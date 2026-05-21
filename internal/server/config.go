@@ -10,6 +10,7 @@ type Config struct {
 	Port     string `json:"port"`
 	DBDSN    string `json:"db_dsn"`
 	LogLevel string `json:"log_level"`
+	APIKey   string `json:"api_key"`
 }
 
 // LoadConfig retrieves configurations from environment variables or a file.
@@ -37,6 +38,9 @@ func LoadConfig(filePath string) (*Config, error) {
 	}
 	if envLogLevel := os.Getenv("SPECGUARD_LOG_LEVEL"); envLogLevel != "" {
 		cfg.LogLevel = envLogLevel
+	}
+	if envAPIKey := os.Getenv("SPECGUARD_API_KEY"); envAPIKey != "" {
+		cfg.APIKey = envAPIKey
 	}
 
 	return cfg, nil
