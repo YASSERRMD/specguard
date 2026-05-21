@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/YASSERRMD/specguard/internal/adapters/grpc"
 	"github.com/YASSERRMD/specguard/internal/adapters/rest"
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/YASSERRMD/specguard/internal/store"
@@ -169,9 +170,15 @@ func (s *Server) handleSpecs(w http.ResponseWriter, r *http.Request) {
 
 		var spec *core.NormalizedSpec
 		if req.Raw != "" {
-			adapter := rest.NewAdapter()
 			var err error
-			spec, err = adapter.LoadSpec([]byte(req.Raw))
+			isProto := strings.Contains(req.Raw, "syntax = \"proto") || strings.Contains(req.Raw, "syntax = 'proto") || strings.Contains(req.Raw, "service ")
+			if isProto {
+				adapter := grpc.NewAdapter()
+				spec, err = adapter.LoadSpec([]byte(req.Raw))
+			} else {
+				adapter := rest.NewAdapter()
+				spec, err = adapter.LoadSpec([]byte(req.Raw))
+			}
 			if err != nil {
 				s.logger.Error("failed to parse spec", "id", req.ID, "error", err)
 				s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse spec: %v", err))
@@ -326,7 +333,18 @@ func (s *Server) handleMocksStart(w http.ResponseWriter, r *http.Request) {
 		delete(s.mocks, req.ID)
 	}
 
-	adapter := rest.NewAdapter()
+	var adapter core.ProtocolAdapter = rest.NewAdapter()
+	isGRPC := false
+	for _, op := range spec.Operations {
+		if op.Metadata != nil && op.Metadata["protocol"] == "grpc" {
+			isGRPC = true
+			break
+		}
+	}
+	if isGRPC {
+		adapter = grpc.NewAdapter()
+	}
+
 	runnableMock, err := adapter.GenerateMock(spec, *mockCfg)
 	if err != nil {
 		s.logger.Error("failed to generate mock server", "id", req.ID, "error", err)
@@ -418,7 +436,18 @@ func (s *Server) handleContractRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adapter := rest.NewAdapter()
+	var adapter core.ProtocolAdapter = rest.NewAdapter()
+	isGRPC := false
+	for _, op := range spec.Operations {
+		if op.Metadata != nil && op.Metadata["protocol"] == "grpc" {
+			isGRPC = true
+			break
+		}
+	}
+	if isGRPC {
+		adapter = grpc.NewAdapter()
+	}
+
 	result, err := adapter.RunContractChecks(spec, req.TargetURL)
 	if err != nil {
 		s.logger.Error("contract validation failed with execution error", "id", req.ID, "error", err)

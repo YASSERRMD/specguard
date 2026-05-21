@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/YASSERRMD/specguard/internal/adapters/grpc"
 	"github.com/YASSERRMD/specguard/internal/adapters/rest"
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/YASSERRMD/specguard/internal/server"
@@ -358,6 +360,12 @@ func loadSpecFromFile(filePath string) (*core.NormalizedSpec, error) {
 	var spec core.NormalizedSpec
 	if err := json.Unmarshal(content, &spec); err == nil && len(spec.Operations) > 0 {
 		return &spec, nil
+	}
+
+	isProto := strings.HasSuffix(filePath, ".proto") || strings.Contains(string(content), "syntax = \"proto") || strings.Contains(string(content), "syntax = 'proto") || strings.Contains(string(content), "service ")
+	if isProto {
+		adapter := grpc.NewAdapter()
+		return adapter.LoadSpec(content)
 	}
 
 	adapter := rest.NewAdapter()
