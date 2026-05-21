@@ -1,10 +1,13 @@
 package rest
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -16,15 +19,41 @@ import (
 	"github.com/YASSERRMD/specguard/internal/core"
 )
 
+type statusResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (srw *statusResponseWriter) WriteHeader(code int) {
+	srw.statusCode = code
+	srw.ResponseWriter.WriteHeader(code)
+}
+
+func (srw *statusResponseWriter) Write(b []byte) (int, error) {
+	if srw.statusCode == 0 {
+		srw.statusCode = http.StatusOK
+	}
+	return srw.ResponseWriter.Write(b)
+}
+
+func (srw *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := srw.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+
 // MockServer implements core.RunnableMock for HTTP mock servers.
 type MockServer struct {
-	spec     *core.NormalizedSpec
-	config   core.MockConfig
-	listener net.Listener
-	server   *http.Server
-	address  string
-	mu       sync.Mutex
-	running  bool
+	spec        *core.NormalizedSpec
+	config      core.MockConfig
+	listener    net.Listener
+	server      *http.Server
+	address     string
+	mu          sync.Mutex
+	running     bool
+	rateLimiter *core.RateLimiter
 
 	stateMu     sync.RWMutex
 	state       map[string][]map[string]interface{}
@@ -34,12 +63,19 @@ type MockServer struct {
 
 // NewMockServer creates a new instance of MockServer.
 func NewMockServer(spec *core.NormalizedSpec, config core.MockConfig) *MockServer {
+	limit := config.RateLimit
+	if limit == 0 {
+		limit = 100 // default 100 rps
+	} else if limit < 0 {
+		limit = 0 // unlimited
+	}
 	ms := &MockServer{
 		spec:        spec,
 		config:      config,
 		state:       make(map[string][]map[string]interface{}),
 		counters:    make(map[string]int64),
 		initialized: make(map[string]bool),
+		rateLimiter: core.NewRateLimiter(limit, int(limit)+1),
 	}
 	ms.seedState()
 	return ms
@@ -243,6 +279,42 @@ func (m *MockServer) GetAddress() string {
 }
 
 func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	srw := &statusResponseWriter{ResponseWriter: w}
+	w = srw
+
+	defer func() {
+		duration := time.Since(startTime)
+		statusStr := strconv.Itoa(srw.statusCode)
+		if srw.statusCode == 0 {
+			statusStr = "200"
+			srw.statusCode = 200
+		}
+		
+		// Record metrics
+		core.Metrics.RecordMockRequest(m.config.ID, r.Method, r.URL.Path, statusStr)
+
+		// Structured logging
+		slog.Info("mock request processed",
+			"mock_id", m.config.ID,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", srw.statusCode,
+			"duration_ms", duration.Milliseconds(),
+		)
+	}()
+
+	// 1. Rate Limiting
+	if m.rateLimiter != nil && !m.rateLimiter.Allow() {
+		m.writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
+
+	// 2. Max Request Body Size Limit
+	if m.config.MaxRequestBodySize > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, m.config.MaxRequestBodySize)
+	}
+
 	if r.URL.Path == "/__reset" && r.Method == http.MethodPost {
 		m.ResetState()
 		w.WriteHeader(http.StatusOK)
@@ -345,6 +417,11 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if _, exists := matchedOp.Input.Properties["body"]; exists {
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				m.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			m.writeError(w, http.StatusBadRequest, fmt.Sprintf("failed to read body: %v", err))
 			return
 		}
