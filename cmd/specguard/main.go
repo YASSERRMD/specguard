@@ -162,6 +162,9 @@ func makeRequest(method, path string, body interface{}) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	if apiKey := os.Getenv("SPECGUARD_API_KEY"); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

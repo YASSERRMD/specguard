@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"strconv"
@@ -24,22 +25,30 @@ import (
 
 // MockServer implements core.RunnableMock for gRPC mock servers.
 type MockServer struct {
-	spec     *core.NormalizedSpec
-	config   core.MockConfig
-	listener net.Listener
-	server   *grpc.Server
-	address  string
-	mu       sync.Mutex
-	running  bool
-	methods  map[string]protoreflect.MethodDescriptor
+	spec        *core.NormalizedSpec
+	config      core.MockConfig
+	listener    net.Listener
+	server      *grpc.Server
+	address     string
+	mu          sync.Mutex
+	running     bool
+	methods     map[string]protoreflect.MethodDescriptor
+	rateLimiter *core.RateLimiter
 }
 
 // NewMockServer creates a new instance of MockServer.
 func NewMockServer(spec *core.NormalizedSpec, config core.MockConfig) *MockServer {
+	limit := config.RateLimit
+	if limit == 0 {
+		limit = 100 // default 100 rps
+	} else if limit < 0 {
+		limit = 0 // unlimited
+	}
 	return &MockServer{
-		spec:    spec,
-		config:  config,
-		methods: make(map[string]protoreflect.MethodDescriptor),
+		spec:        spec,
+		config:      config,
+		methods:     make(map[string]protoreflect.MethodDescriptor),
+		rateLimiter: core.NewRateLimiter(limit, int(limit)+1),
 	}
 }
 
@@ -106,10 +115,13 @@ func (m *MockServer) Start() error {
 	m.listener = lis
 	m.address = lis.Addr().String()
 
-	// 4. Create grpc server with unknown service handler
-	m.server = grpc.NewServer(
-		grpc.UnknownServiceHandler(m.handleStream),
-	)
+	// 4. Create grpc server with unknown service handler and size limit options
+	var opts []grpc.ServerOption
+	opts = append(opts, grpc.UnknownServiceHandler(m.handleStream))
+	if m.config.MaxRequestBodySize > 0 {
+		opts = append(opts, grpc.MaxRecvMsgSize(int(m.config.MaxRequestBodySize)))
+	}
+	m.server = grpc.NewServer(opts...)
 
 	m.running = true
 
@@ -237,9 +249,44 @@ func (m *MockServer) processMessageAndValidate(ctx context.Context, op core.Oper
 	return outMsg, nil
 }
 
-func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) error {
+func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) (err error) {
+	startTime := time.Now()
 	ctx := stream.Context()
 	methodPath, ok := grpc.Method(ctx)
+	if !ok {
+		methodPath = "/unknown/method"
+	}
+
+	defer func() {
+		duration := time.Since(startTime)
+		statusCode := codes.OK
+		if err != nil {
+			if st, ok := status.FromError(err); ok {
+				statusCode = st.Code()
+			} else {
+				statusCode = codes.Unknown
+			}
+		}
+		statusStr := strconv.Itoa(int(statusCode))
+
+		// Record metrics
+		core.Metrics.RecordMockRequest(m.config.ID, "gRPC", methodPath, statusStr)
+
+		// Structured logging
+		slog.Info("gRPC mock request processed",
+			"mock_id", m.config.ID,
+			"method", methodPath,
+			"status_code", statusCode.String(),
+			"status_numeric", int(statusCode),
+			"duration_ms", duration.Milliseconds(),
+		)
+	}()
+
+	// 1. Rate Limiting
+	if m.rateLimiter != nil && !m.rateLimiter.Allow() {
+		return status.Error(codes.ResourceExhausted, "rate limit exceeded")
+	}
+
 	if !ok {
 		return status.Error(codes.Internal, "failed to get method from context")
 	}
@@ -254,7 +301,7 @@ func (m *MockServer) handleStream(srv interface{}, stream grpc.ServerStream) err
 		return status.Errorf(codes.Unimplemented, "descriptor for %q not found", methodPath)
 	}
 
-	// 1. Evaluate Chaos Injection
+	// 2. Evaluate Chaos Injection
 	if triggered, err := m.evaluateChaos(stream); triggered {
 		return err
 	}

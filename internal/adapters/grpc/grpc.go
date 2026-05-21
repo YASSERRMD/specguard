@@ -28,7 +28,17 @@ func NewAdapter() *Adapter {
 }
 
 // LoadSpec parses a raw protobuf specification (.proto) into the NormalizedSpec model.
-func (a *Adapter) LoadSpec(source []byte) (*core.NormalizedSpec, error) {
+func (a *Adapter) LoadSpec(source []byte) (spec *core.NormalizedSpec, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic recovered during protobuf spec loading: %v", r)
+		}
+	}()
+
+	if len(source) == 0 {
+		return nil, fmt.Errorf("proto source is empty")
+	}
+
 	files := map[string]string{
 		"input.proto": string(source),
 	}
