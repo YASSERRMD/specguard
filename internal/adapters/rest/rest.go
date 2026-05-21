@@ -24,18 +24,25 @@ func NewAdapter() *Adapter {
 }
 
 // LoadSpec parses a raw OpenAPI specification (JSON or YAML) into the NormalizedSpec model.
-func (a *Adapter) LoadSpec(source []byte) (*core.NormalizedSpec, error) {
+func (a *Adapter) LoadSpec(source []byte) (spec *core.NormalizedSpec, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic recovered during openapi spec parsing: %v", r)
+			spec = nil
+		}
+	}()
+
 	loader := openapi3.NewLoader()
-	doc, err := loader.LoadFromData(source)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse openapi document: %w", err)
+	doc, loadErr := loader.LoadFromData(source)
+	if loadErr != nil {
+		return nil, fmt.Errorf("failed to parse openapi document: %w", loadErr)
 	}
 
 	// Validate the specification document itself
 	ctx := loader.Context
-	err = doc.Validate(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("invalid openapi specification: %w", err)
+	loadErr = doc.Validate(ctx)
+	if loadErr != nil {
+		return nil, fmt.Errorf("invalid openapi specification: %w", loadErr)
 	}
 
 	operations := make(map[string]core.Operation)
