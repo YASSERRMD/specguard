@@ -230,11 +230,11 @@ func TestRESTPath_EndToEnd(t *testing.T) {
 	}
 
 	// 9. Run contract checks against conforming mock SUT via CLI
-	outCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "e2e-spec", startResult.Address)
+	outCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "e2e-spec", startResult.Address, "--format", "json")
 	if err != nil {
 		t.Fatalf("contract run against conforming mock SUT failed: %v, output: %s", err, outCheck)
 	}
-	if !strings.Contains(outCheck, `"passed":true`) {
+	if !strings.Contains(outCheck, `"passed": true`) {
 		t.Errorf("expected contract checks to pass, got output: %s", outCheck)
 	}
 
@@ -264,11 +264,11 @@ func TestRESTPath_EndToEnd(t *testing.T) {
 	driftSrv := httptest.NewServer(driftSrvMux)
 	defer driftSrv.Close()
 
-	outDrift, err := execCLI(t, apiSrv.URL, "contract", "run", "e2e-spec", driftSrv.URL)
-	if err != nil {
-		t.Fatalf("contract run against drifting SUT failed: %v, output: %s", err, outDrift)
+	outDrift, err := execCLI(t, apiSrv.URL, "contract", "run", "e2e-spec", driftSrv.URL, "--format", "json")
+	if err == nil {
+		t.Fatalf("expected contract checks to fail with non-zero exit for drifting SUT, got exit 0. Output: %s", outDrift)
 	}
-	if !strings.Contains(outDrift, `"passed":false`) {
+	if !strings.Contains(outDrift, `"passed": false`) {
 		t.Errorf("expected contract checks to fail for drifting SUT, got output: %s", outDrift)
 	}
 
@@ -306,6 +306,9 @@ func TestRESTPath_EndToEnd(t *testing.T) {
 func extractRunID(cliOutput string) string {
 	var res struct {
 		RunID string `json:"run_id"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(cliOutput)), &res); err == nil && res.RunID != "" {
+		return res.RunID
 	}
 	parts := strings.Split(cliOutput, "Response: ")
 	if len(parts) >= 2 {

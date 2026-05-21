@@ -264,11 +264,11 @@ func TestGRPCPath_EndToEnd(t *testing.T) {
 	}
 
 	// 9. Run contract checks against conforming mock SUT via CLI
-	outCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "grpc-e2e-spec", startResult.Address)
+	outCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "grpc-e2e-spec", startResult.Address, "--format", "json")
 	if err != nil {
 		t.Fatalf("contract run against conforming mock SUT failed: %v, output: %s", err, outCheck)
 	}
-	if !strings.Contains(outCheck, `"passed":true`) {
+	if !strings.Contains(outCheck, `"passed": true`) {
 		t.Errorf("expected contract checks to pass, got output: %s", outCheck)
 	}
 
@@ -348,11 +348,11 @@ func TestGRPCPath_EndToEnd(t *testing.T) {
 	defer driftSrv.Stop()
 
 	// Run contract run via CLI against drifting SUT
-	outDriftCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "grpc-e2e-spec", driftLis.Addr().String())
-	if err != nil {
-		t.Fatalf("contract run against drifting SUT failed: %v, output: %s", err, outDriftCheck)
+	outDriftCheck, err := execCLI(t, apiSrv.URL, "contract", "run", "grpc-e2e-spec", driftLis.Addr().String(), "--format", "json")
+	if err == nil {
+		t.Fatalf("expected contract run to exit non-zero for drifting SUT, got exit 0. Output: %s", outDriftCheck)
 	}
-	if !strings.Contains(outDriftCheck, `"passed":false`) {
+	if !strings.Contains(outDriftCheck, `"passed": false`) {
 		t.Errorf("expected contract checks to fail, got output: %s", outDriftCheck)
 	}
 
