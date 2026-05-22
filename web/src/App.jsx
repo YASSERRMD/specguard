@@ -20,8 +20,11 @@ import {
   Sliders,
   Sparkles
 } from 'lucide-react';
-
-const DEFAULT_SERVER_URL = 'http://localhost:8080';
+const DEFAULT_SERVER_URL = typeof window !== 'undefined'
+  ? (window.location.port === '5173' || window.location.port === '3000'
+      ? 'http://localhost:8080'
+      : window.location.origin)
+  : 'http://localhost:8080';
 
 // Recursive Schema Tree Viewer Component
 function SchemaViewer({ name, schema, depth = 0 }) {
