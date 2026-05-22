@@ -161,9 +161,31 @@ function OperationAccordion({ opId, op }) {
 
 export default function App() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
+  const [apiKey, setApiKey] = useState(() => {
+    return localStorage.getItem('specguard_api_key') || 'my_secure_api_key';
+  });
   const [connected, setConnected] = useState(false);
   const [activeTab, setActiveTab] = useState('specs');
   
+  // Keep API Key updated in localStorage
+  useEffect(() => {
+    localStorage.setItem('specguard_api_key', apiKey);
+  }, [apiKey]);
+
+  // Helper for authenticated API calls
+  const apiFetch = async (urlPath, options = {}) => {
+    const headers = {
+      ...options.headers,
+    };
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+    return fetch(`${serverUrl}${urlPath}`, {
+      ...options,
+      headers,
+    });
+  };
+
   // Specs state
   const [specs, setSpecs] = useState([]);
   const [selectedSpecId, setSelectedSpecId] = useState('');
@@ -208,7 +230,7 @@ export default function App() {
       loadSpecs();
       loadRunningMocks();
     }
-  }, [connected]);
+  }, [connected, apiKey]);
 
   // Load selected spec details
   useEffect(() => {
@@ -219,11 +241,11 @@ export default function App() {
     } else {
       setSelectedSpec(null);
     }
-  }, [selectedSpecId, connected]);
+  }, [selectedSpecId, connected, apiKey]);
 
   const loadSpecs = async () => {
     try {
-      const res = await fetch(`${serverUrl}/api/specs`);
+      const res = await apiFetch('/api/specs');
       if (res.ok) {
         const data = await res.json();
         setSpecs(data);
@@ -236,7 +258,7 @@ export default function App() {
 
   const loadRunningMocks = async () => {
     try {
-      const res = await fetch(`${serverUrl}/api/mocks`);
+      const res = await apiFetch('/api/mocks');
       if (res.ok) {
         const data = await res.json();
         setRunningMocks(data);
@@ -246,7 +268,7 @@ export default function App() {
 
   const loadSpecDetails = async (id) => {
     try {
-      const res = await fetch(`${serverUrl}/api/specs?id=${encodeURIComponent(id)}`);
+      const res = await apiFetch(`/api/specs?id=${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         setSelectedSpec(data);
@@ -256,7 +278,7 @@ export default function App() {
 
   const loadMockConfig = async (id) => {
     try {
-      const res = await fetch(`${serverUrl}/api/mocks/config?id=${encodeURIComponent(id)}`);
+      const res = await apiFetch(`/api/mocks/config?id=${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         // Ensure nesting safety
@@ -276,7 +298,7 @@ export default function App() {
 
   const loadContractHistory = async (id) => {
     try {
-      const res = await fetch(`${serverUrl}/api/reports/?spec_id=${encodeURIComponent(id)}`);
+      const res = await apiFetch(`/api/reports/?spec_id=${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         setRunHistory(data);
@@ -291,7 +313,7 @@ export default function App() {
 
     setUploading(true);
     try {
-      const res = await fetch(`${serverUrl}/api/specs`, {
+      const res = await apiFetch('/api/specs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: newSpecId, raw: newSpecRaw })
@@ -357,7 +379,7 @@ export default function App() {
 
     setSavingConfigSpecId(specId);
     try {
-      const res = await fetch(`${serverUrl}/api/mocks/config`, {
+      const res = await apiFetch('/api/mocks/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: specId, config })
@@ -381,7 +403,7 @@ export default function App() {
     await saveMockConfig(specId);
 
     try {
-      const res = await fetch(`${serverUrl}/api/mocks/start`, {
+      const res = await apiFetch('/api/mocks/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: specId })
@@ -402,7 +424,7 @@ export default function App() {
   // Stop mock server
   const handleStopMock = async (specId) => {
     try {
-      const res = await fetch(`${serverUrl}/api/mocks/stop`, {
+      const res = await apiFetch('/api/mocks/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: specId })
@@ -432,7 +454,7 @@ export default function App() {
     setRunningCheck(true);
     setCheckResult(null);
     try {
-      const res = await fetch(`${serverUrl}/api/contract/run`, {
+      const res = await apiFetch('/api/contract/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id: selectedSpecId, target_url: targetUrl })
@@ -455,7 +477,7 @@ export default function App() {
   // View historical drift details
   const viewHistoryDetail = async (runId) => {
     try {
-      const res = await fetch(`${serverUrl}/api/reports/${runId}`);
+      const res = await apiFetch(`/api/reports/${runId}`);
       if (res.ok) {
         const data = await res.json();
         setSelectedHistoryRun({ runId, findings: data.findings || [] });
@@ -538,6 +560,17 @@ export default function App() {
               value={serverUrl} 
               onChange={(e) => setServerUrl(e.target.value)} 
               placeholder="http://localhost:8080"
+            />
+          </div>
+          <div className="config-title">API Key</div>
+          <div className="config-input-wrapper">
+            <ShieldCheck size={14} style={{ color: 'var(--text-secondary)', marginRight: '6px' }} />
+            <input 
+              type="password" 
+              className="config-input" 
+              value={apiKey} 
+              onChange={(e) => setApiKey(e.target.value)} 
+              placeholder="Enter API Key"
             />
           </div>
           <div className="connection-status">
