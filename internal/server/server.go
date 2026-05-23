@@ -171,7 +171,25 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		allowedOrigins := os.Getenv("SPECGUARD_ALLOWED_ORIGINS")
+		if allowedOrigins != "" {
+			origins := strings.Split(allowedOrigins, ",")
+			allowed := false
+			for _, o := range origins {
+				if strings.TrimSpace(o) == origin {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+		} else {
+			if origin == "" || strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {

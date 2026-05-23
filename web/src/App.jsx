@@ -162,7 +162,7 @@ function OperationAccordion({ opId, op }) {
 export default function App() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_SERVER_URL);
   const [apiKey, setApiKey] = useState(() => {
-    return localStorage.getItem('specguard_api_key') || 'my_secure_api_key';
+    return localStorage.getItem('specguard_api_key') || '';
   });
   const [connected, setConnected] = useState(false);
   const [activeTab, setActiveTab] = useState('specs');
