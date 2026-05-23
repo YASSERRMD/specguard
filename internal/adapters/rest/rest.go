@@ -369,7 +369,7 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 
 		actualPath := pathPattern
 		if pathSchema, ok := op.Input.Properties["path"]; ok {
-			pathVals := generateValueForSchema(pathSchema)
+			pathVals := core.GenerateValueForSchema(pathSchema)
 			if m, ok := pathVals.(map[string]interface{}); ok {
 				for name, val := range m {
 					actualPath = strings.Replace(actualPath, "{"+name+"}", fmt.Sprintf("%v", val), -1)
@@ -384,7 +384,7 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 		reqURL := tURL + actualPath
 
 		if querySchema, ok := op.Input.Properties["query"]; ok {
-			queryVals := generateValueForSchema(querySchema)
+			queryVals := core.GenerateValueForSchema(querySchema)
 			if m, ok := queryVals.(map[string]interface{}); ok {
 				queryParams := url.Values{}
 				for name, val := range m {
@@ -399,7 +399,7 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 		var bodyReader io.Reader
 		var bodyBytes []byte
 		if bodySchema, ok := op.Input.Properties["body"]; ok {
-			bodyVal := generateValueForSchema(bodySchema)
+			bodyVal := core.GenerateValueForSchema(bodySchema)
 			var err error
 			bodyBytes, err = json.Marshal(bodyVal)
 			if err != nil {
@@ -414,7 +414,7 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 		}
 
 		if headerSchema, ok := op.Input.Properties["header"]; ok {
-			headerVals := generateValueForSchema(headerSchema)
+			headerVals := core.GenerateValueForSchema(headerSchema)
 			if m, ok := headerVals.(map[string]interface{}); ok {
 				for name, val := range m {
 					req.Header.Set(name, fmt.Sprintf("%v", val))
@@ -509,68 +509,6 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 		Passed:      passed,
 		DriftReport: report,
 	}, nil
-}
-
-func generateValueForSchema(s core.Schema) interface{} {
-	switch s.Type {
-	case core.TypeScalar:
-		switch s.ScalarType {
-		case core.ScalarInteger:
-			val := 1
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.Atoi(c.Value); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarNumber:
-			val := 1.0
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.ParseFloat(c.Value, 64); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarBoolean:
-			return true
-		case core.ScalarString:
-			for _, c := range s.Constraints {
-				if c.Kind == "format" {
-					if c.Value == "uuid" {
-						return "123e4567-e89b-12d3-a456-426614174000"
-					}
-					if c.Value == "date-time" {
-						return "2026-05-21T06:10:00Z"
-					}
-				}
-			}
-			return "mock_value"
-		default:
-			return "mock_value"
-		}
-	case core.TypeEnum:
-		if len(s.EnumValues) > 0 {
-			return s.EnumValues[0]
-		}
-		return "enum_default"
-	case core.TypeArray:
-		if s.Item != nil {
-			return []interface{}{generateValueForSchema(*s.Item)}
-		}
-		return []interface{}{}
-	case core.TypeObject:
-		res := make(map[string]interface{})
-		for propName, propSchema := range s.Properties {
-			res[propName] = generateValueForSchema(propSchema)
-		}
-		return res
-	default:
-		return nil
-	}
 }
 
 // NormalizeResult satisfies the core.ProtocolAdapter interface.

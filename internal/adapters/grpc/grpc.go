@@ -282,7 +282,7 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 			continue
 		}
 
-		reqVal := generateValueForSchema(op.Input)
+		reqVal := core.GenerateValueForSchema(op.Input)
 		reqJSON, err := json.Marshal(reqVal)
 		if err != nil {
 			return core.CheckResult{}, fmt.Errorf("failed to marshal request value for %s: %w", opID, err)
@@ -566,67 +566,5 @@ func (a *Adapter) NormalizeResult(rawResult interface{}) (*core.DriftReport, err
 		return &r, nil
 	default:
 		return nil, fmt.Errorf("unsupported raw result type: %T", rawResult)
-	}
-}
-
-func generateValueForSchema(s core.Schema) interface{} {
-	switch s.Type {
-	case core.TypeScalar:
-		switch s.ScalarType {
-		case core.ScalarInteger:
-			val := 1
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.Atoi(c.Value); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarNumber:
-			val := 1.0
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.ParseFloat(c.Value, 64); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarBoolean:
-			return true
-		case core.ScalarString:
-			for _, c := range s.Constraints {
-				if c.Kind == "format" {
-					if c.Value == "uuid" {
-						return "123e4567-e89b-12d3-a456-426614174000"
-					}
-					if c.Value == "date-time" {
-						return "2026-05-21T06:10:00Z"
-					}
-				}
-			}
-			return "mock_value"
-		default:
-			return "mock_value"
-		}
-	case core.TypeEnum:
-		if len(s.EnumValues) > 0 {
-			return s.EnumValues[0]
-		}
-		return "enum_default"
-	case core.TypeArray:
-		if s.Item != nil {
-			return []interface{}{generateValueForSchema(*s.Item)}
-		}
-		return []interface{}{}
-	case core.TypeObject:
-		res := make(map[string]interface{})
-		for propName, propSchema := range s.Properties {
-			res[propName] = generateValueForSchema(propSchema)
-		}
-		return res
-	default:
-		return nil
 	}
 }
