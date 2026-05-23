@@ -242,7 +242,11 @@ func (m *MockServer) Start() error {
 	mux.HandleFunc("/", m.handleRequest)
 
 	m.server = &http.Server{
-		Handler: mux,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	m.running = true

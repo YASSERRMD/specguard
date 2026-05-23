@@ -69,8 +69,12 @@ func NewServer(cfg *Config, dbStore store.Store, logger *slog.Logger) *Server {
 	}
 
 	srv.server = &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: srv.loggingMiddleware(srv.corsMiddleware(srv.authMiddleware(mux))),
+		Addr:              ":" + cfg.Port,
+		Handler:           srv.loggingMiddleware(srv.corsMiddleware(srv.authMiddleware(mux))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	return srv
