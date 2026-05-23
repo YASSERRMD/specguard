@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { 
   Database, 
   Cpu, 
@@ -17,8 +17,7 @@ import {
   AlertCircle, 
   AlertTriangle,
   FileCode,
-  Sliders,
-  Sparkles
+  Sliders
 } from 'lucide-react';
 const DEFAULT_SERVER_URL = typeof window !== 'undefined'
   ? (window.location.port === '5173' || window.location.port === '3000'
@@ -173,7 +172,7 @@ export default function App() {
   }, [apiKey]);
 
   // Helper for authenticated API calls
-  const apiFetch = async (urlPath, options = {}) => {
+  const apiFetch = useCallback(async (urlPath, options = {}) => {
     const headers = {
       ...options.headers,
     };
@@ -184,7 +183,7 @@ export default function App() {
       ...options,
       headers,
     });
-  };
+  }, [serverUrl, apiKey]);
 
   // Specs state
   const [specs, setSpecs] = useState([]);
@@ -208,42 +207,7 @@ export default function App() {
   const [runHistory, setRunHistory] = useState([]);
   const [selectedHistoryRun, setSelectedHistoryRun] = useState(null);
 
-  // Connection check loop
-  useEffect(() => {
-    const ping = async () => {
-      try {
-        const res = await fetch(`${serverUrl}/health`);
-        const data = await res.json();
-        setConnected(data.status === 'ok');
-      } catch (err) {
-        setConnected(false);
-      }
-    };
-    ping();
-    const interval = setInterval(ping, 5000);
-    return () => clearInterval(interval);
-  }, [serverUrl]);
-
-  // Load Specs & Running Mocks list when connected
-  useEffect(() => {
-    if (connected) {
-      loadSpecs();
-      loadRunningMocks();
-    }
-  }, [connected, apiKey]);
-
-  // Load selected spec details
-  useEffect(() => {
-    if (connected && selectedSpecId) {
-      loadSpecDetails(selectedSpecId);
-      loadMockConfig(selectedSpecId);
-      loadContractHistory(selectedSpecId);
-    } else {
-      setSelectedSpec(null);
-    }
-  }, [selectedSpecId, connected, apiKey]);
-
-  const loadSpecs = async () => {
+  const loadSpecs = useCallback(async () => {
     try {
       const res = await apiFetch('/api/specs');
       if (res.ok) {
@@ -253,30 +217,36 @@ export default function App() {
           setSelectedSpecId(data[0]);
         }
       }
-    } catch (e) {}
-  };
+    } catch (e) {
+      console.error("Failed to load specs:", e);
+    }
+  }, [apiFetch, selectedSpecId]);
 
-  const loadRunningMocks = async () => {
+  const loadRunningMocks = useCallback(async () => {
     try {
       const res = await apiFetch('/api/mocks');
       if (res.ok) {
         const data = await res.json();
         setRunningMocks(data);
       }
-    } catch (e) {}
-  };
+    } catch (e) {
+      console.error("Failed to load running mocks:", e);
+    }
+  }, [apiFetch]);
 
-  const loadSpecDetails = async (id) => {
+  const loadSpecDetails = useCallback(async (id) => {
     try {
       const res = await apiFetch(`/api/specs?id=${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         setSelectedSpec(data);
       }
-    } catch (e) {}
-  };
+    } catch (e) {
+      console.error("Failed to load spec details:", e);
+    }
+  }, [apiFetch]);
 
-  const loadMockConfig = async (id) => {
+  const loadMockConfig = useCallback(async (id) => {
     try {
       const res = await apiFetch(`/api/mocks/config?id=${encodeURIComponent(id)}`);
       if (res.ok) {
@@ -293,18 +263,70 @@ export default function App() {
         }
         setMockConfigs(prev => ({ ...prev, [id]: data }));
       }
-    } catch (e) {}
-  };
+    } catch (e) {
+      console.error("Failed to load mock config:", e);
+    }
+  }, [apiFetch]);
 
-  const loadContractHistory = async (id) => {
+  const loadContractHistory = useCallback(async (id) => {
     try {
       const res = await apiFetch(`/api/reports/?spec_id=${encodeURIComponent(id)}`);
       if (res.ok) {
         const data = await res.json();
         setRunHistory(data);
       }
-    } catch (e) {}
-  };
+    } catch (e) {
+      console.error("Failed to load contract history:", e);
+    }
+  }, [apiFetch]);
+
+  // Connection check loop
+  useEffect(() => {
+    const ping = async () => {
+      try {
+        const res = await fetch(`${serverUrl}/health`);
+        const data = await res.json();
+        setConnected(data.status === 'ok');
+      } catch (err) {
+        console.error("Ping failed:", err);
+        setConnected(false);
+      }
+    };
+    ping();
+    const interval = setInterval(ping, 5000);
+    return () => clearInterval(interval);
+  }, [serverUrl]);
+
+  // Load Specs & Running Mocks list when connected
+  useEffect(() => {
+    if (connected) {
+      const t = setTimeout(() => {
+        loadSpecs();
+        loadRunningMocks();
+      }, 0);
+      return () => clearTimeout(t);
+    }
+  }, [connected, loadSpecs, loadRunningMocks]);
+
+  // Load selected spec details
+  useEffect(() => {
+    if (connected && selectedSpecId) {
+      const t = setTimeout(() => {
+        loadSpecDetails(selectedSpecId);
+        loadMockConfig(selectedSpecId);
+        loadContractHistory(selectedSpecId);
+      }, 0);
+      return () => clearTimeout(t);
+    } else {
+      const t = setTimeout(() => {
+        setSelectedSpec(prev => {
+          if (prev !== null) return null;
+          return prev;
+        });
+      }, 0);
+      return () => clearTimeout(t);
+    }
+  }, [selectedSpecId, connected, loadSpecDetails, loadMockConfig, loadContractHistory]);
 
   // Upload spec handler
   const handleUploadSpec = async (e) => {
