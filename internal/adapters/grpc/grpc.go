@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/bufbuild/protocompile"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -139,6 +141,9 @@ func (a *Adapter) translateMessage(desc protoreflect.MessageDescriptor, visited 
 			return nil, err
 		}
 		properties[fieldName] = *fieldSchema
+		if field.Cardinality() == protoreflect.Required {
+			required = append(required, fieldName)
+		}
 	}
 
 	return &core.Schema{
@@ -257,7 +262,28 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 	}
 
 	// 2. Establish connection to SUT.
-	conn, err := grpc.NewClient(targetURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	useTLS := false
+	address := targetURL
+	if strings.HasPrefix(targetURL, "grpcs://") {
+		useTLS = true
+		address = strings.TrimPrefix(targetURL, "grpcs://")
+	} else if strings.HasPrefix(targetURL, "grpc://") {
+		useTLS = false
+		address = strings.TrimPrefix(targetURL, "grpc://")
+	} else {
+		if strings.HasSuffix(targetURL, ":443") || strings.Contains(targetURL, ":443/") {
+			useTLS = true
+		}
+	}
+
+	var creds credentials.TransportCredentials
+	if useTLS {
+		creds = credentials.NewTLS(&tls.Config{})
+	} else {
+		creds = insecure.NewCredentials()
+	}
+
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return core.CheckResult{}, fmt.Errorf("failed to dial target %s: %w", targetURL, err)
 	}
