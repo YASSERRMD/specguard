@@ -23,10 +23,13 @@ func LoadConfig(filePath string) (*Config, error) {
 
 	if filePath != "" {
 		file, err := os.Open(filePath)
-		if err == nil {
-			defer file.Close()
-			dec := json.NewDecoder(file)
-			_ = dec.Decode(cfg)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		dec := json.NewDecoder(file)
+		if err := dec.Decode(cfg); err != nil {
+			return nil, err
 		}
 	}
 
