@@ -4,6 +4,31 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrdValue(pub serde_json::Value);
+
+impl PartialEq for OrdValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for OrdValue {}
+
+impl PartialOrd for OrdValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrdValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let s1 = serde_json::to_string(&self.0).unwrap_or_default();
+        let s2 = serde_json::to_string(&other.0).unwrap_or_default();
+        s1.cmp(&s2)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Constraint {
     pub kind: String,
@@ -32,6 +57,27 @@ pub struct Schema {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enum_values: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_of: Vec<Schema>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub any_of: Vec<Schema>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub all_of: Vec<Schema>,
+
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nullable: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_properties: Option<Box<Schema>>,
+
+    #[serde(rename = "default", skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<OrdValue>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example: Option<OrdValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +160,83 @@ fn diff_schema(
     actual: &Schema,
     findings: &mut Vec<Finding>,
 ) {
+    if expected.nullable != actual.nullable {
+        findings.push(Finding {
+            location: format!("{}.nullable", location),
+            kind: "constraint-violated".to_string(),
+            expected: expected.nullable.to_string(),
+            actual: actual.nullable.to_string(),
+            severity: "error".to_string(),
+        });
+    }
+
+    match (&expected.additional_properties, &actual.additional_properties) {
+        (Some(exp_ap), Some(act_ap)) => {
+            diff_schema(&format!("{}.additional_properties", location), exp_ap, act_ap, findings);
+        }
+        (Some(_), None) => {
+            findings.push(Finding {
+                location: format!("{}.additional_properties", location),
+                kind: "missing".to_string(),
+                expected: "additionalProperties schema".to_string(),
+                actual: "nil".to_string(),
+                severity: "error".to_string(),
+            });
+        }
+        (None, Some(_)) => {
+            findings.push(Finding {
+                location: format!("{}.additional_properties", location),
+                kind: "added".to_string(),
+                expected: "nil".to_string(),
+                actual: "additionalProperties schema".to_string(),
+                severity: "info".to_string(),
+            });
+        }
+        (None, None) => {}
+    }
+
+    if expected.one_of.len() != actual.one_of.len() {
+        findings.push(Finding {
+            location: format!("{}.one_of", location),
+            kind: "constraint-violated".to_string(),
+            expected: format!("oneOf len {}", expected.one_of.len()),
+            actual: format!("oneOf len {}", actual.one_of.len()),
+            severity: "error".to_string(),
+        });
+    } else {
+        for (i, (exp_sub, act_sub)) in expected.one_of.iter().zip(actual.one_of.iter()).enumerate() {
+            diff_schema(&format!("{}.one_of[{}]", location, i), exp_sub, act_sub, findings);
+        }
+    }
+
+    if expected.any_of.len() != actual.any_of.len() {
+        findings.push(Finding {
+            location: format!("{}.any_of", location),
+            kind: "constraint-violated".to_string(),
+            expected: format!("anyOf len {}", expected.any_of.len()),
+            actual: format!("anyOf len {}", actual.any_of.len()),
+            severity: "error".to_string(),
+        });
+    } else {
+        for (i, (exp_sub, act_sub)) in expected.any_of.iter().zip(actual.any_of.iter()).enumerate() {
+            diff_schema(&format!("{}.any_of[{}]", location, i), exp_sub, act_sub, findings);
+        }
+    }
+
+    if expected.all_of.len() != actual.all_of.len() {
+        findings.push(Finding {
+            location: format!("{}.all_of", location),
+            kind: "constraint-violated".to_string(),
+            expected: format!("allOf len {}", expected.all_of.len()),
+            actual: format!("allOf len {}", actual.all_of.len()),
+            severity: "error".to_string(),
+        });
+    } else {
+        for (i, (exp_sub, act_sub)) in expected.all_of.iter().zip(actual.all_of.iter()).enumerate() {
+            diff_schema(&format!("{}.all_of[{}]", location, i), exp_sub, act_sub, findings);
+        }
+    }
+
     if expected.schema_type != actual.schema_type {
         findings.push(Finding {
             location: location.to_string(),
@@ -260,7 +383,7 @@ fn diff_schema(
                 }
             }
 
-            for (prop_name, _act_prop) in &actual.properties {
+            for prop_name in actual.properties.keys() {
                 if !expected.properties.contains_key(prop_name) {
                     findings.push(Finding {
                         location: format!("{}.properties.{}", location, prop_name),
@@ -312,7 +435,7 @@ pub fn diff_spec_internal(spec_a: &NormalizedSpec, spec_b: &NormalizedSpec) -> D
                         }
                     }
                 }
-                for (status, _err_b) in &op_b.error_shapes {
+                for status in op_b.error_shapes.keys() {
                     if !op_a.error_shapes.contains_key(status) {
                         findings.push(Finding {
                             location: format!("{}.error_shapes", op_loc),
@@ -327,7 +450,7 @@ pub fn diff_spec_internal(spec_a: &NormalizedSpec, spec_b: &NormalizedSpec) -> D
         }
     }
 
-    for (op_id, _op_b) in &spec_b.operations {
+    for op_id in spec_b.operations.keys() {
         if !spec_a.operations.contains_key(op_id) {
             findings.push(Finding {
                 location: "operations".to_string(),
@@ -342,6 +465,12 @@ pub fn diff_spec_internal(spec_a: &NormalizedSpec, spec_b: &NormalizedSpec) -> D
     DriftReport { findings }
 }
 
+/// Hashing a spec from a JSON C-string.
+///
+/// # Safety
+///
+/// The caller must ensure that `spec_json` points to a valid, null-terminated C string.
+/// The returned pointer is owned by the caller and must be freed using `free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn hash_spec(spec_json: *const c_char) -> *mut c_char {
     if spec_json.is_null() {
@@ -363,6 +492,12 @@ pub unsafe extern "C" fn hash_spec(spec_json: *const c_char) -> *mut c_char {
     c_string.into_raw()
 }
 
+/// Diffing two specs from JSON C-strings.
+///
+/// # Safety
+///
+/// The caller must ensure that both `spec_a_json` and `spec_b_json` point to valid, null-terminated C strings.
+/// The returned pointer is owned by the caller and must be freed using `free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn diff_specs(spec_a_json: *const c_char, spec_b_json: *const c_char) -> *mut c_char {
     if spec_a_json.is_null() || spec_b_json.is_null() {
@@ -394,9 +529,69 @@ pub unsafe extern "C" fn diff_specs(spec_a_json: *const c_char, spec_b_json: *co
     c_string.into_raw()
 }
 
+/// Freeing a C-string returned by other FFI functions.
+///
+/// # Safety
+///
+/// The caller must ensure that `s` is a valid pointer allocated by `hash_spec` or `diff_specs` and has not been freed yet.
 #[no_mangle]
 pub unsafe extern "C" fn free_string(s: *mut c_char) {
     if !s.is_null() {
         let _ = CString::from_raw(s);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_spec_internal() {
+        let spec_json = r#"{
+            "operations": {
+                "get_user": {
+                    "id": "get_user",
+                    "input": { "type": "object", "properties": {} },
+                    "output": { "type": "object", "properties": {} }
+                }
+            }
+        }"#;
+        let spec: NormalizedSpec = serde_json::from_str(spec_json).unwrap();
+        let h = hash_spec_internal(&spec);
+        assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn test_diff_spec_internal() {
+        let spec_a_json = r#"{
+            "operations": {
+                "get_user": {
+                    "id": "get_user",
+                    "input": { "type": "object", "properties": {} },
+                    "output": { "type": "object", "properties": {} }
+                }
+            }
+        }"#;
+        let spec_b_json = r#"{
+            "operations": {
+                "get_user": {
+                    "id": "get_user",
+                    "input": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "scalar", "scalar_type": "string" }
+                        },
+                        "required": ["name"]
+                    },
+                    "output": { "type": "object", "properties": {} }
+                }
+            }
+        }"#;
+        let spec_a: NormalizedSpec = serde_json::from_str(spec_a_json).unwrap();
+        let spec_b: NormalizedSpec = serde_json::from_str(spec_b_json).unwrap();
+        let report = diff_spec_internal(&spec_a, &spec_b);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].kind, "added");
+    }
+}
+
