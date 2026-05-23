@@ -88,9 +88,9 @@ function SchemaViewer({ name, schema, depth = 0 }) {
           ))}
         </div>
       )}
-      {expanded && isArray && schema.array_items && (
+      {expanded && isArray && schema.item && (
         <div style={{ borderLeft: '1px solid rgba(255,255,255,0.06)', marginLeft: '14px', paddingLeft: '4px' }}>
-          <SchemaViewer name="items" schema={schema.array_items} depth={depth + 1} />
+          <SchemaViewer name="items" schema={schema.item} depth={depth + 1} />
         </div>
       )}
     </div>
@@ -113,41 +113,41 @@ function OperationAccordion({ opId, op }) {
   return (
     <div className="op-row">
       <div className="op-header" onClick={() => setOpen(!open)}>
-        <span className={getMethodBadgeClass(op.Metadata?.method)}>{op.Metadata?.method || 'ANY'}</span>
-        <span className="op-path">{op.Metadata?.path || '/'}</span>
+        <span className={getMethodBadgeClass(op.metadata?.method)}>{op.metadata?.method || 'ANY'}</span>
+        <span className="op-path">{op.metadata?.path || '/'}</span>
         <span className="op-id">{opId}</span>
         {open ? <ChevronDown size={18} style={{ color: 'var(--text-secondary)' }} /> : 
                 <ChevronRight size={18} style={{ color: 'var(--text-secondary)' }} />}
       </div>
       {open && (
         <div className="op-details">
-          {op.Input && Object.keys(op.Input.properties || {}).length > 0 && (
+          {op.input && Object.keys(op.input.properties || {}).length > 0 && (
             <div>
               <div className="schema-header" style={{ color: 'var(--accent-primary)' }}>Input schemas (Parameters / Body)</div>
               <div className="schema-block">
-                {Object.entries(op.Input.properties).map(([key, schema]) => (
+                {Object.entries(op.input.properties).map(([key, schema]) => (
                   <SchemaViewer key={key} name={key} schema={schema} />
                 ))}
               </div>
             </div>
           )}
 
-          {op.Output && Object.keys(op.Output.properties || {}).length > 0 && (
+          {op.output && Object.keys(op.output.properties || {}).length > 0 && (
             <div>
               <div className="schema-header" style={{ color: 'var(--status-success)' }}>Successful responses</div>
               <div className="schema-block">
-                {Object.entries(op.Output.properties).map(([status, schema]) => (
+                {Object.entries(op.output.properties).map(([status, schema]) => (
                   <SchemaViewer key={status} name={`status: ${status}`} schema={schema} />
                 ))}
               </div>
             </div>
           )}
 
-          {op.ErrorShapes && Object.keys(op.ErrorShapes || {}).length > 0 && (
+          {op.error_shapes && Object.keys(op.error_shapes || {}).length > 0 && (
             <div>
               <div className="schema-header" style={{ color: 'var(--status-warning)' }}>Error responses</div>
               <div className="schema-block">
-                {Object.entries(op.ErrorShapes).map(([status, schema]) => (
+                {Object.entries(op.error_shapes).map(([status, schema]) => (
                   <SchemaViewer key={status} name={`status: ${status}`} schema={schema} />
                 ))}
               </div>
