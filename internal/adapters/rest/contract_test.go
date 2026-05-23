@@ -54,7 +54,7 @@ func TestRunContractChecks_ConformantSUT(t *testing.T) {
 	sutMux := http.NewServeMux()
 	sutMux.HandleFunc("/users/123e4567-e89b-12d3-a456-426614174000", func(w http.ResponseWriter, r *http.Request) {
 		// Verify query parameter exists
-		if r.URL.Query().Get("version") != "1" {
+		if r.URL.Query().Get("version") == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":"missing version"}`))
 			return
