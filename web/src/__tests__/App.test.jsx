@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import App from '../App';
+// eslint-disable-next-line no-unused-vars
 import React from 'react';
 
 describe('App', () => {
