@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"time"
@@ -384,15 +385,21 @@ func (s Schema) matchArray(val interface{}, path string) error {
 }
 
 func (s Schema) matchArrayReflection(val interface{}, path string) error {
-	importReflect := true
-	if importReflect {
-		// Reflection fallback
-		typeOf := fmt.Sprintf("%T", val)
+	v := reflect.ValueOf(val)
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
 		return &ValidationError{
 			Path:     path,
 			Expected: "array or slice",
-			Actual:   typeOf,
+			Actual:   fmt.Sprintf("%T", val),
 			Message:  "unsupported slice type or not a slice",
+		}
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		item := v.Index(i).Interface()
+		itemPath := fmt.Sprintf("%s[%d]", path, i)
+		if err := s.Item.matchWithPath(item, itemPath); err != nil {
+			return err
 		}
 	}
 	return nil

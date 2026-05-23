@@ -261,3 +261,40 @@ func TestMatchObject(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestMatchArrayReflection(t *testing.T) {
+	schema := Schema{
+		Type: TypeArray,
+		Item: &Schema{
+			Type:       TypeScalar,
+			ScalarType: ScalarString,
+		},
+	}
+
+	// Custom string slice type to trigger reflection fallback
+	type CustomStringSlice []string
+	customSlice := CustomStringSlice{"a", "b", "c"}
+
+	if err := schema.Match(customSlice); err != nil {
+		t.Errorf("expected custom slice to validate using reflection: %v", err)
+	}
+
+	// Custom map slice type
+	type CustomMapSlice []map[string]interface{}
+	mapSchema := Schema{
+		Type: TypeArray,
+		Item: &Schema{
+			Type: TypeObject,
+			Properties: map[string]Schema{
+				"Name": {Type: TypeScalar, ScalarType: ScalarString},
+			},
+		},
+	}
+	mapSlice := CustomMapSlice{
+		{"Name": "Yasser"},
+		{"Name": "Arafath"},
+	}
+	if err := mapSchema.Match(mapSlice); err != nil {
+		t.Errorf("expected map slice to validate: %v", err)
+	}
+}
