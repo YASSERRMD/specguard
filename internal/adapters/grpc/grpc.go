@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/YASSERRMD/specguard/internal/core"
 	"github.com/bufbuild/protocompile"
+	"github.com/bufbuild/protocompile/linker"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -139,6 +142,9 @@ func (a *Adapter) translateMessage(desc protoreflect.MessageDescriptor, visited 
 			return nil, err
 		}
 		properties[fieldName] = *fieldSchema
+		if field.Cardinality() == protoreflect.Required {
+			required = append(required, fieldName)
+		}
 	}
 
 	return &core.Schema{
@@ -209,38 +215,43 @@ func (a *Adapter) GenerateMock(spec *core.NormalizedSpec, config core.MockConfig
 	return NewMockServer(spec, config), nil
 }
 
-// RunContractChecks satisfies core.ProtocolAdapter.
+// RunContractChecks satisfies the core.ProtocolAdapter interface.
 func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string) (core.CheckResult, error) {
 	report := &core.DriftReport{
 		Findings: []core.Finding{},
 	}
 
-	// 1. Compile spec proto source to build methods map.
-	var protoSource string
+	// 1. Compile descriptors to locate service/method schemas
+	var fds linker.Files
 	for _, op := range spec.Operations {
-		if src, exists := op.Metadata["proto_source"]; exists && src != "" {
-			protoSource = src
+		if proto, ok := op.Metadata["protocol"]; ok && proto == "grpc" {
+			protoSource := op.Metadata["proto_source"]
+			if protoSource == "" {
+				continue
+			}
+			files := map[string]string{
+				"input.proto": protoSource,
+			}
+			compiler := protocompile.Compiler{
+				Resolver: protocompile.WithStandardImports(&protocompile.SourceResolver{
+					Accessor: protocompile.SourceAccessorFromMap(files),
+				}),
+			}
+			var err error
+			fds, err = compiler.Compile(context.Background(), "input.proto")
+			if err != nil {
+				return core.CheckResult{}, fmt.Errorf("failed to compile proto: %w", err)
+			}
 			break
 		}
 	}
-	if protoSource == "" {
-		return core.CheckResult{}, fmt.Errorf("missing proto_source metadata in spec")
-	}
 
-	files := map[string]string{
-		"input.proto": protoSource,
-	}
-	compiler := protocompile.Compiler{
-		Resolver: protocompile.WithStandardImports(&protocompile.SourceResolver{
-			Accessor: protocompile.SourceAccessorFromMap(files),
-		}),
-	}
-	fds, err := compiler.Compile(context.Background(), "input.proto")
-	if err != nil {
-		return core.CheckResult{}, fmt.Errorf("failed to compile proto: %w", err)
-	}
 	if len(fds) == 0 {
-		return core.CheckResult{}, fmt.Errorf("no compiled descriptors found")
+		// No gRPC operations to verify
+		return core.CheckResult{
+			Passed:      true,
+			DriftReport: report,
+		}, nil
 	}
 
 	fd := fds[0]
@@ -257,7 +268,28 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 	}
 
 	// 2. Establish connection to SUT.
-	conn, err := grpc.NewClient(targetURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	useTLS := false
+	address := targetURL
+	if strings.HasPrefix(targetURL, "grpcs://") {
+		useTLS = true
+		address = strings.TrimPrefix(targetURL, "grpcs://")
+	} else if strings.HasPrefix(targetURL, "grpc://") {
+		useTLS = false
+		address = strings.TrimPrefix(targetURL, "grpc://")
+	} else {
+		if strings.HasSuffix(targetURL, ":443") || strings.Contains(targetURL, ":443/") {
+			useTLS = true
+		}
+	}
+
+	var creds credentials.TransportCredentials
+	if useTLS {
+		creds = credentials.NewTLS(&tls.Config{})
+	} else {
+		creds = insecure.NewCredentials()
+	}
+
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return core.CheckResult{}, fmt.Errorf("failed to dial target %s: %w", targetURL, err)
 	}
@@ -282,106 +314,93 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 			continue
 		}
 
-		reqVal := generateValueForSchema(op.Input)
-		reqJSON, err := json.Marshal(reqVal)
-		if err != nil {
-			return core.CheckResult{}, fmt.Errorf("failed to marshal request value for %s: %w", opID, err)
+		type grpcVariant struct {
+			name        string
+			expectError bool
+			inputVal    interface{}
 		}
 
-		inMsg := dynamicpb.NewMessage(methodDesc.Input())
-		uOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
-		if err := uOpts.Unmarshal(reqJSON, inMsg); err != nil {
-			return core.CheckResult{}, fmt.Errorf("failed to unmarshal request JSON to protobuf for %s: %w", opID, err)
+		var variants []grpcVariant
+		variants = append(variants, grpcVariant{
+			name:        "base_happy_path",
+			expectError: false,
+			inputVal:    core.GenerateValueForSchema(op.Input),
+		})
+		variants = append(variants, grpcVariant{
+			name:        "edge_case_request",
+			expectError: false,
+			inputVal:    core.GenerateEdgeCaseValueForSchema(op.Input),
+		})
+		if len(op.ErrorShapes) > 0 {
+			variants = append(variants, grpcVariant{
+				name:        "invalid_request",
+				expectError: true,
+				inputVal:    core.GenerateInvalidValueForSchema(op.Input),
+			})
 		}
 
-		isClientStream := methodDesc.IsStreamingClient()
-		isServerStream := methodDesc.IsStreamingServer()
+		for _, v := range variants {
+			reqJSON, err := json.Marshal(v.inputVal)
+			if err != nil {
+				return core.CheckResult{}, fmt.Errorf("failed to marshal request value for %s (%s): %w", opID, v.name, err)
+			}
 
-		var callErr error
-		var responses []*dynamicpb.Message
+			inMsg := dynamicpb.NewMessage(methodDesc.Input())
+			uOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
+			if err := uOpts.Unmarshal(reqJSON, inMsg); err != nil {
+				return core.CheckResult{}, fmt.Errorf("failed to unmarshal request JSON to protobuf for %s (%s): %w", opID, v.name, err)
+			}
 
-		func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+			isClientStream := methodDesc.IsStreamingClient()
+			isServerStream := methodDesc.IsStreamingServer()
 
-			if !isClientStream && !isServerStream {
-				// Unary
-				outMsg := dynamicpb.NewMessage(methodDesc.Output())
-				callErr = conn.Invoke(ctx, op.ID, inMsg, outMsg)
-				if callErr == nil {
-					responses = append(responses, outMsg)
-				}
-			} else {
-				desc := &grpc.StreamDesc{
-					StreamName:    string(methodDesc.Name()),
-					ServerStreams: isServerStream,
-					ClientStreams: isClientStream,
-				}
-				str, streamErr := conn.NewStream(ctx, desc, op.ID)
-				if streamErr != nil {
-					callErr = streamErr
-					return
-				}
+			var callErr error
+			var responses []*dynamicpb.Message
 
-				if isClientStream && !isServerStream {
-					// Client Streaming
-					if err := str.SendMsg(inMsg); err != nil {
-						callErr = err
-					} else if err := str.SendMsg(inMsg); err != nil {
-						callErr = err
-					} else if err := str.CloseSend(); err != nil {
-						callErr = err
-					} else {
-						outMsg := dynamicpb.NewMessage(methodDesc.Output())
-						if err := str.RecvMsg(outMsg); err != nil {
+			func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				if !isClientStream && !isServerStream {
+					// Unary
+					outMsg := dynamicpb.NewMessage(methodDesc.Output())
+					callErr = conn.Invoke(ctx, op.ID, inMsg, outMsg)
+					if callErr == nil {
+						responses = append(responses, outMsg)
+					}
+				} else {
+					desc := &grpc.StreamDesc{
+						StreamName:    string(methodDesc.Name()),
+						ServerStreams: isServerStream,
+						ClientStreams: isClientStream,
+					}
+					str, streamErr := conn.NewStream(ctx, desc, op.ID)
+					if streamErr != nil {
+						callErr = streamErr
+						return
+					}
+
+					if isClientStream && !isServerStream {
+						// Client Streaming
+						if err := str.SendMsg(inMsg); err != nil {
+							callErr = err
+						} else if err := str.SendMsg(inMsg); err != nil {
+							callErr = err
+						} else if err := str.CloseSend(); err != nil {
 							callErr = err
 						} else {
-							responses = append(responses, outMsg)
-						}
-					}
-				} else if !isClientStream && isServerStream {
-					// Server Streaming
-					if err := str.SendMsg(inMsg); err != nil {
-						callErr = err
-					} else if err := str.CloseSend(); err != nil {
-						callErr = err
-					} else {
-						for {
 							outMsg := dynamicpb.NewMessage(methodDesc.Output())
-							if err := str.RecvMsg(outMsg); err == io.EOF {
-								break
-							} else if err != nil {
+							if err := str.RecvMsg(outMsg); err != nil {
 								callErr = err
-								break
 							} else {
 								responses = append(responses, outMsg)
 							}
 						}
-					}
-				} else {
-					// Bidirectional Streaming
-					if err := str.SendMsg(inMsg); err != nil {
-						callErr = err
-					} else {
-						outMsg1 := dynamicpb.NewMessage(methodDesc.Output())
-						if err := str.RecvMsg(outMsg1); err != nil {
+					} else if !isClientStream && isServerStream {
+						// Server Streaming
+						if err := str.SendMsg(inMsg); err != nil {
 							callErr = err
-						} else {
-							responses = append(responses, outMsg1)
-							if err := str.SendMsg(inMsg); err != nil {
-								callErr = err
-							} else {
-								outMsg2 := dynamicpb.NewMessage(methodDesc.Output())
-								if err := str.RecvMsg(outMsg2); err != nil {
-									callErr = err
-								} else {
-									responses = append(responses, outMsg2)
-								}
-							}
-						}
-					}
-					if callErr == nil {
-						if err := str.CloseSend(); err != nil {
+						} else if err := str.CloseSend(); err != nil {
 							callErr = err
 						} else {
 							for {
@@ -396,144 +415,241 @@ func (a *Adapter) RunContractChecks(spec *core.NormalizedSpec, targetURL string)
 								}
 							}
 						}
-					}
-				}
-			}
-		}()
-
-		if callErr != nil {
-			st, ok := status.FromError(callErr)
-			if ok {
-				statusStr := strconv.Itoa(int(st.Code()))
-				var matchSchema *core.Schema
-				var isError bool
-
-				if schema, exists := op.Output.Properties[statusStr]; exists {
-					matchSchema = &schema
-					isError = false
-				} else if schema, exists := op.ErrorShapes[statusStr]; exists {
-					matchSchema = &schema
-					isError = true
-				}
-
-				if matchSchema == nil {
-					report.Findings = append(report.Findings, core.Finding{
-						Location: "operations." + opID + ".output." + statusStr,
-						Kind:     core.KindMissing,
-						Expected: "status code defined in spec",
-						Actual:   "status " + statusStr + " (" + st.Code().String() + ")",
-						Severity: core.SeverityError,
-					})
-				} else {
-					details := st.Details()
-					var parsedDetail interface{}
-					if len(details) > 0 {
-						if pm, ok := details[0].(protoreflect.ProtoMessage); ok {
-							mOpts := protojson.MarshalOptions{UseProtoNames: true}
-							jsonBytes, err := mOpts.Marshal(pm)
-							if err == nil {
-								_ = json.Unmarshal(jsonBytes, &parsedDetail)
-							}
-						} else {
-							parsedDetail = fmt.Sprintf("%v", details[0])
-						}
 					} else {
-						parsedDetail = map[string]interface{}{
-							"error": st.Message(),
+						// Bidirectional Streaming
+						if err := str.SendMsg(inMsg); err != nil {
+							callErr = err
+						} else {
+							outMsg1 := dynamicpb.NewMessage(methodDesc.Output())
+							if err := str.RecvMsg(outMsg1); err != nil {
+								callErr = err
+							} else {
+								responses = append(responses, outMsg1)
+								if err := str.SendMsg(inMsg); err != nil {
+									callErr = err
+								} else {
+									outMsg2 := dynamicpb.NewMessage(methodDesc.Output())
+									if err := str.RecvMsg(outMsg2); err != nil {
+										callErr = err
+									} else {
+										responses = append(responses, outMsg2)
+									}
+								}
+							}
+						}
+						if callErr == nil {
+							if err := str.CloseSend(); err != nil {
+								callErr = err
+							} else {
+								for {
+									outMsg := dynamicpb.NewMessage(methodDesc.Output())
+									if err := str.RecvMsg(outMsg); err == io.EOF {
+										break
+									} else if err != nil {
+										callErr = err
+										break
+									} else {
+										responses = append(responses, outMsg)
+									}
+								}
+							}
 						}
 					}
+				}
+			}()
 
-					if err := matchSchema.Match(parsedDetail); err != nil {
-						severity := core.SeverityError
-						if isError {
-							severity = core.SeverityWarning
+			if callErr != nil {
+				st, ok := status.FromError(callErr)
+				if ok {
+					statusStr := strconv.Itoa(int(st.Code()))
+
+					// If we expect an error response
+					if v.expectError {
+						if st.Code() == 0 {
+							report.Findings = append(report.Findings, core.Finding{
+								Location: "operations." + opID + "." + v.name + ".status",
+								Kind:     core.KindConstraintViolated,
+								Expected: "non-zero gRPC error status code",
+								Actual:   "0 (OK)",
+								Severity: core.SeverityError,
+							})
 						}
+						if schema, exists := op.ErrorShapes[statusStr]; exists {
+							details := st.Details()
+							var parsedDetail interface{}
+							if len(details) > 0 {
+								if pm, ok := details[0].(protoreflect.ProtoMessage); ok {
+									mOpts := protojson.MarshalOptions{UseProtoNames: true}
+									jsonBytes, err := mOpts.Marshal(pm)
+									if err == nil {
+										_ = json.Unmarshal(jsonBytes, &parsedDetail)
+									}
+								} else {
+									parsedDetail = fmt.Sprintf("%v", details[0])
+								}
+							} else {
+								parsedDetail = map[string]interface{}{
+									"error": st.Message(),
+								}
+							}
+							if err := schema.Match(parsedDetail); err != nil {
+								report.Findings = append(report.Findings, core.Finding{
+									Location: "operations." + opID + ".error_shapes." + statusStr,
+									Kind:     core.KindConstraintViolated,
+									Expected: "conformant error schema",
+									Actual:   fmt.Sprintf("%s (variant: %s)", err.Error(), v.name),
+									Severity: core.SeverityWarning,
+								})
+							}
+						}
+						continue
+					}
+
+					// We expect success (0) but got error
+					var matchSchema *core.Schema
+					var isError bool
+
+					if schema, exists := op.Output.Properties[statusStr]; exists {
+						matchSchema = &schema
+						isError = false
+					} else if schema, exists := op.ErrorShapes[statusStr]; exists {
+						matchSchema = &schema
+						isError = true
+					}
+
+					if matchSchema == nil {
 						report.Findings = append(report.Findings, core.Finding{
 							Location: "operations." + opID + ".output." + statusStr,
-							Kind:     core.KindConstraintViolated,
-							Expected: "conformant schema structure",
-							Actual:   err.Error(),
-							Severity: severity,
+							Kind:     core.KindMissing,
+							Expected: "status code defined in spec",
+							Actual:   fmt.Sprintf("status %s (%s) (variant: %s)", statusStr, st.Code().String(), v.name),
+							Severity: core.SeverityError,
 						})
-					}
-				}
-			} else {
-				report.Findings = append(report.Findings, core.Finding{
-					Location: "operations." + opID,
-					Kind:     core.KindMissing,
-					Expected: "gRPC status code response",
-					Actual:   "error: " + callErr.Error(),
-					Severity: core.SeverityError,
-				})
-			}
-			continue
-		}
-
-		// Validate all successful responses
-		for _, resp := range responses {
-			mOpts := protojson.MarshalOptions{UseProtoNames: true}
-			jsonBytes, err := mOpts.Marshal(resp)
-			if err != nil {
-				report.Findings = append(report.Findings, core.Finding{
-					Location: "operations." + opID + ".output.0",
-					Kind:     core.KindTypeChanged,
-					Expected: "valid protobuf marshal",
-					Actual:   err.Error(),
-					Severity: core.SeverityError,
-				})
-				continue
-			}
-
-			var respVal interface{}
-			if err := json.Unmarshal(jsonBytes, &respVal); err != nil {
-				report.Findings = append(report.Findings, core.Finding{
-					Location: "operations." + opID + ".output.0",
-					Kind:     core.KindTypeChanged,
-					Expected: "valid JSON unmarshal",
-					Actual:   err.Error(),
-					Severity: core.SeverityError,
-				})
-				continue
-			}
-
-			successSchema, hasSuccess := op.Output.Properties["0"]
-			if !hasSuccess {
-				report.Findings = append(report.Findings, core.Finding{
-					Location: "operations." + opID + ".output.0",
-					Kind:     core.KindMissing,
-					Expected: "success schema '0' in operation output properties",
-					Actual:   "missing",
-					Severity: core.SeverityError,
-				})
-				continue
-			}
-
-			if err := successSchema.Match(respVal); err != nil {
-				kind := core.KindConstraintViolated
-				expectedVal := "conformant schema structure"
-				actualVal := err.Error()
-				location := "operations." + opID + ".output.0"
-
-				if vErr, ok := err.(*core.ValidationError); ok {
-					expectedVal = vErr.Expected
-					actualVal = vErr.Actual
-					if vErr.Path != "" && vErr.Path != "$" {
-						location = "operations." + opID + ".output.0." + strings.TrimPrefix(vErr.Path, "$.")
-					}
-					if vErr.Actual == "missing" {
-						kind = core.KindMissing
 					} else {
-						kind = core.KindTypeChanged
-					}
-				}
+						details := st.Details()
+						var parsedDetail interface{}
+						if len(details) > 0 {
+							if pm, ok := details[0].(protoreflect.ProtoMessage); ok {
+								mOpts := protojson.MarshalOptions{UseProtoNames: true}
+								jsonBytes, err := mOpts.Marshal(pm)
+								if err == nil {
+									_ = json.Unmarshal(jsonBytes, &parsedDetail)
+								}
+							} else {
+								parsedDetail = fmt.Sprintf("%v", details[0])
+							}
+						} else {
+							parsedDetail = map[string]interface{}{
+								"error": st.Message(),
+							}
+						}
 
+						if err := matchSchema.Match(parsedDetail); err != nil {
+							severity := core.SeverityError
+							if isError {
+								severity = core.SeverityWarning
+							}
+							report.Findings = append(report.Findings, core.Finding{
+								Location: "operations." + opID + ".output." + statusStr,
+								Kind:     core.KindConstraintViolated,
+								Expected: "conformant schema structure",
+								Actual:   fmt.Sprintf("%s (variant: %s)", err.Error(), v.name),
+								Severity: severity,
+							})
+						}
+					}
+				} else {
+					report.Findings = append(report.Findings, core.Finding{
+						Location: "operations." + opID,
+						Kind:     core.KindMissing,
+						Expected: "gRPC status code response",
+						Actual:   fmt.Sprintf("error: %s (variant: %s)", callErr.Error(), v.name),
+						Severity: core.SeverityError,
+					})
+				}
+				continue
+			}
+
+			// If call was successful (status OK), but we expected an error:
+			if v.expectError {
 				report.Findings = append(report.Findings, core.Finding{
-					Location: location,
-					Kind:     kind,
-					Expected: expectedVal,
-					Actual:   actualVal,
+					Location: "operations." + opID + ".input",
+					Kind:     core.KindConstraintViolated,
+					Expected: "non-zero gRPC error status code",
+					Actual:   fmt.Sprintf("0 (OK) (variant: %s)", v.name),
 					Severity: core.SeverityError,
 				})
+				continue
+			}
+
+			// Validate all successful responses
+			for _, resp := range responses {
+				mOpts := protojson.MarshalOptions{UseProtoNames: true}
+				jsonBytes, err := mOpts.Marshal(resp)
+				if err != nil {
+					report.Findings = append(report.Findings, core.Finding{
+						Location: "operations." + opID + ".output.0",
+						Kind:     core.KindTypeChanged,
+						Expected: "valid protobuf marshal",
+						Actual:   fmt.Sprintf("%s (variant: %s)", err.Error(), v.name),
+						Severity: core.SeverityError,
+					})
+					continue
+				}
+
+				var respVal interface{}
+				if err := json.Unmarshal(jsonBytes, &respVal); err != nil {
+					report.Findings = append(report.Findings, core.Finding{
+						Location: "operations." + opID + ".output.0",
+						Kind:     core.KindTypeChanged,
+						Expected: "valid JSON unmarshal",
+						Actual:   fmt.Sprintf("%s (variant: %s)", err.Error(), v.name),
+						Severity: core.SeverityError,
+					})
+					continue
+				}
+
+				successSchema, hasSuccess := op.Output.Properties["0"]
+				if !hasSuccess {
+					report.Findings = append(report.Findings, core.Finding{
+						Location: "operations." + opID + ".output.0",
+						Kind:     core.KindMissing,
+						Expected: "success schema '0' in operation output properties",
+						Actual:   fmt.Sprintf("missing (variant: %s)", v.name),
+						Severity: core.SeverityError,
+					})
+					continue
+				}
+
+				if err := successSchema.Match(respVal); err != nil {
+					kind := core.KindConstraintViolated
+					expectedVal := "conformant schema structure"
+					actualVal := err.Error()
+					location := "operations." + opID + ".output.0"
+
+					if vErr, ok := err.(*core.ValidationError); ok {
+						expectedVal = vErr.Expected
+						actualVal = fmt.Sprintf("%s (variant: %s)", vErr.Actual, v.name)
+						if vErr.Path != "" && vErr.Path != "$" {
+							location = "operations." + opID + ".output.0." + strings.TrimPrefix(vErr.Path, "$.")
+						}
+						if vErr.Actual == "missing" {
+							kind = core.KindMissing
+						} else {
+							kind = core.KindTypeChanged
+						}
+					} else {
+						actualVal = fmt.Sprintf("%s (variant: %s)", err.Error(), v.name)
+					}
+
+					report.Findings = append(report.Findings, core.Finding{
+						Location: location,
+						Kind:     kind,
+						Expected: expectedVal,
+						Actual:   actualVal,
+						Severity: core.SeverityError,
+					})
+				}
 			}
 		}
 	}
@@ -566,67 +682,5 @@ func (a *Adapter) NormalizeResult(rawResult interface{}) (*core.DriftReport, err
 		return &r, nil
 	default:
 		return nil, fmt.Errorf("unsupported raw result type: %T", rawResult)
-	}
-}
-
-func generateValueForSchema(s core.Schema) interface{} {
-	switch s.Type {
-	case core.TypeScalar:
-		switch s.ScalarType {
-		case core.ScalarInteger:
-			val := 1
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.Atoi(c.Value); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarNumber:
-			val := 1.0
-			for _, c := range s.Constraints {
-				if c.Kind == "min" {
-					if v, err := strconv.ParseFloat(c.Value, 64); err == nil && val < v {
-						val = v
-					}
-				}
-			}
-			return val
-		case core.ScalarBoolean:
-			return true
-		case core.ScalarString:
-			for _, c := range s.Constraints {
-				if c.Kind == "format" {
-					if c.Value == "uuid" {
-						return "123e4567-e89b-12d3-a456-426614174000"
-					}
-					if c.Value == "date-time" {
-						return "2026-05-21T06:10:00Z"
-					}
-				}
-			}
-			return "mock_value"
-		default:
-			return "mock_value"
-		}
-	case core.TypeEnum:
-		if len(s.EnumValues) > 0 {
-			return s.EnumValues[0]
-		}
-		return "enum_default"
-	case core.TypeArray:
-		if s.Item != nil {
-			return []interface{}{generateValueForSchema(*s.Item)}
-		}
-		return []interface{}{}
-	case core.TypeObject:
-		res := make(map[string]interface{})
-		for propName, propSchema := range s.Properties {
-			res[propName] = generateValueForSchema(propSchema)
-		}
-		return res
-	default:
-		return nil
 	}
 }

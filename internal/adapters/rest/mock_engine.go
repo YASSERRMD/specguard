@@ -43,7 +43,6 @@ func (srw *statusResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
 }
 
-
 // MockServer implements core.RunnableMock for HTTP mock servers.
 type MockServer struct {
 	spec        *core.NormalizedSpec
@@ -243,7 +242,11 @@ func (m *MockServer) Start() error {
 	mux.HandleFunc("/", m.handleRequest)
 
 	m.server = &http.Server{
-		Handler: mux,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	m.running = true
@@ -290,7 +293,7 @@ func (m *MockServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 			statusStr = "200"
 			srw.statusCode = 200
 		}
-		
+
 		// Record metrics
 		core.Metrics.RecordMockRequest(m.config.ID, r.Method, r.URL.Path, statusStr)
 

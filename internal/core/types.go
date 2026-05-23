@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"time"
@@ -35,13 +36,20 @@ type Constraint struct {
 
 // Schema represents a recursive protocol-neutral data shape.
 type Schema struct {
-	Type        SchemaType        `json:"type"`
-	Properties  map[string]Schema `json:"properties,omitempty"`
-	Required    []string          `json:"required,omitempty"`
-	Item        *Schema           `json:"item,omitempty"`
-	ScalarType  ScalarType        `json:"scalar_type,omitempty"`
-	Constraints []Constraint      `json:"constraints,omitempty"`
-	EnumValues  []string          `json:"enum_values,omitempty"`
+	Type                 SchemaType        `json:"type"`
+	Properties           map[string]Schema `json:"properties,omitempty"`
+	Required             []string          `json:"required,omitempty"`
+	Item                 *Schema           `json:"item,omitempty"`
+	ScalarType           ScalarType        `json:"scalar_type,omitempty"`
+	Constraints          []Constraint      `json:"constraints,omitempty"`
+	EnumValues           []string          `json:"enum_values,omitempty"`
+	OneOf                []Schema          `json:"one_of,omitempty"`
+	AnyOf                []Schema          `json:"any_of,omitempty"`
+	AllOf                []Schema          `json:"all_of,omitempty"`
+	Nullable             bool              `json:"nullable,omitempty"`
+	AdditionalProperties *Schema           `json:"additional_properties,omitempty"`
+	Default              interface{}       `json:"default,omitempty"`
+	Example              interface{}       `json:"example,omitempty"`
 }
 
 // Operation defines a protocol-neutral API endpoint.
@@ -79,12 +87,80 @@ func (s Schema) Match(val interface{}) error {
 
 func (s Schema) matchWithPath(val interface{}, path string) error {
 	if val == nil {
+		if s.Nullable {
+			return nil
+		}
 		return &ValidationError{
 			Path:     path,
 			Expected: string(s.Type),
 			Actual:   "nil",
 			Message:  "value is nil",
 		}
+	}
+
+	if len(s.OneOf) > 0 {
+		matchedCount := 0
+		var lastErr error
+		for _, sub := range s.OneOf {
+			if err := sub.matchWithPath(val, path); err == nil {
+				matchedCount++
+			} else {
+				lastErr = err
+			}
+		}
+		if matchedCount == 1 {
+			return nil
+		}
+		if matchedCount == 0 {
+			return &ValidationError{
+				Path:     path,
+				Expected: "exactly one schema in oneOf to match",
+				Actual:   fmt.Sprintf("matched %d", matchedCount),
+				Message:  fmt.Sprintf("no schema matched, last error: %v", lastErr),
+			}
+		}
+		return &ValidationError{
+			Path:     path,
+			Expected: "exactly one schema in oneOf to match",
+			Actual:   fmt.Sprintf("matched %d", matchedCount),
+			Message:  "multiple schemas matched in oneOf",
+		}
+	}
+
+	if len(s.AnyOf) > 0 {
+		matched := false
+		var lastErr error
+		for _, sub := range s.AnyOf {
+			if err := sub.matchWithPath(val, path); err == nil {
+				matched = true
+				break
+			} else {
+				lastErr = err
+			}
+		}
+		if matched {
+			return nil
+		}
+		return &ValidationError{
+			Path:     path,
+			Expected: "at least one schema in anyOf to match",
+			Actual:   "none matched",
+			Message:  fmt.Sprintf("last error: %v", lastErr),
+		}
+	}
+
+	if len(s.AllOf) > 0 {
+		for i, sub := range s.AllOf {
+			if err := sub.matchWithPath(val, path); err != nil {
+				return &ValidationError{
+					Path:     fmt.Sprintf("%s.allOf[%d]", path, i),
+					Expected: "match allOf sub-schema",
+					Actual:   "mismatch",
+					Message:  err.Error(),
+				}
+			}
+		}
+		return nil
 	}
 
 	switch s.Type {
@@ -384,15 +460,21 @@ func (s Schema) matchArray(val interface{}, path string) error {
 }
 
 func (s Schema) matchArrayReflection(val interface{}, path string) error {
-	importReflect := true
-	if importReflect {
-		// Reflection fallback
-		typeOf := fmt.Sprintf("%T", val)
+	v := reflect.ValueOf(val)
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
 		return &ValidationError{
 			Path:     path,
 			Expected: "array or slice",
-			Actual:   typeOf,
+			Actual:   fmt.Sprintf("%T", val),
 			Message:  "unsupported slice type or not a slice",
+		}
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		item := v.Index(i).Interface()
+		itemPath := fmt.Sprintf("%s[%d]", path, i)
+		if err := s.Item.matchWithPath(item, itemPath); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -423,6 +505,9 @@ func (s Schema) matchObject(val interface{}, path string) error {
 
 	// Recursively validate defined properties
 	for key, subSchema := range s.Properties {
+		if key == "*" {
+			continue
+		}
 		subVal, exists := objMap[key]
 		if exists {
 			var propPath string
@@ -433,6 +518,40 @@ func (s Schema) matchObject(val interface{}, path string) error {
 			}
 			if err := subSchema.matchWithPath(subVal, propPath); err != nil {
 				return err
+			}
+		}
+	}
+
+	// If there is a wildcard key "*", validate all other keys in objMap against it
+	if wildcardSchema, hasWildcard := s.Properties["*"]; hasWildcard {
+		for key, subVal := range objMap {
+			if _, defined := s.Properties[key]; !defined {
+				var propPath string
+				if path == "$" {
+					propPath = fmt.Sprintf("$.%s", key)
+				} else {
+					propPath = fmt.Sprintf("%s.%s", path, key)
+				}
+				if err := wildcardSchema.matchWithPath(subVal, propPath); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// If there is AdditionalProperties, validate all keys not in s.Properties
+	if s.AdditionalProperties != nil {
+		for key, subVal := range objMap {
+			if _, defined := s.Properties[key]; !defined {
+				var propPath string
+				if path == "$" {
+					propPath = fmt.Sprintf("$.%s", key)
+				} else {
+					propPath = fmt.Sprintf("%s.%s", path, key)
+				}
+				if err := s.AdditionalProperties.matchWithPath(subVal, propPath); err != nil {
+					return err
+				}
 			}
 		}
 	}

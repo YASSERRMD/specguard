@@ -7,16 +7,16 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build the Rust library
-FROM rust:1.75-slim AS rust-builder
+FROM rust:1.91-slim AS rust-builder
 WORKDIR /build/rust
 COPY rust/Cargo.toml rust/Cargo.lock ./
 # Create dummy lib file to cache dependencies
 RUN mkdir src && echo "pub fn dummy() {}" > src/lib.rs && cargo build --release && rm -rf src
 COPY rust/src ./src
-RUN cargo build --release
+RUN touch src/lib.rs && cargo build --release
 
 # Stage 3: Build the Go binary
-FROM golang:1.22-bookworm AS go-builder
+FROM golang:1.25-bookworm AS go-builder
 WORKDIR /build
 # Copy compiled Rust static library to expected relative path
 COPY --from=rust-builder /build/rust/target/release/libspecguard_ffi.a /build/rust/target/release/libspecguard_ffi.a
